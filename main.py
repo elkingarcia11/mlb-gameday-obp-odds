@@ -260,6 +260,24 @@ def main() -> None:
     today = date.today()
     season = today.year
     data_dir = Path("data")
+
+    # Backfill W/L/T on past matchup CSVs before writing today's files.
+    from backfill_matchup_results import backfill
+
+    backfill(data_dir, today=today)
+
+    from analyze_historic_favorites import run as run_historic_matchup_analysis
+
+    results_dir = data_dir / "results"
+    run_historic_matchup_analysis(
+        data_dir,
+        results_dir / "historic_matchup_odds_results.csv",
+        results_dir / "historic_matchup_odds_results.txt",
+        {"csv", "txt"},
+        plot=True,
+        out_png=results_dir / "historic_matchup_odds_results.png",
+    )
+
     team_csv = data_dir / f"{today.isoformat()}.csv"
     matchup_csv = data_dir / f"{today.isoformat()}_matchups.csv"
 

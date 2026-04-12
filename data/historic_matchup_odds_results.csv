@@ -1,0 +1,13 @@
+odds_role,matchup_sign,description,wins,losses,ties,no_result,decided_games,win_rate_wl_only
+favorite,lt0,favorite (moneyline); matchup < 0,1,0,0,0,1,1.0000
+favorite,eq0,favorite (moneyline); matchup = 0,0,0,0,0,0,
+favorite,gt0,favorite (moneyline); matchup > 0,1,4,0,0,5,0.2000
+favorite,unknown,favorite (moneyline); matchup unparsable,0,0,0,0,0,
+not_favorite,lt0,not favorite (moneyline); matchup < 0,4,1,0,0,5,0.8000
+not_favorite,eq0,not favorite (moneyline); matchup = 0,0,0,0,0,0,
+not_favorite,gt0,not favorite (moneyline); matchup > 0,0,1,0,0,1,0.0000
+not_favorite,unknown,not favorite (moneyline); matchup unparsable,0,0,0,0,0,
+other,lt0,other odds label (unknown / equal / …); matchup < 0,0,0,0,0,0,
+other,eq0,other odds label (unknown / equal / …); matchup = 0,0,0,0,0,0,
+other,gt0,other odds label (unknown / equal / …); matchup > 0,0,0,0,0,0,
+other,unknown,other odds label (unknown / equal / …); matchup unparsable,0,0,0,0,0,

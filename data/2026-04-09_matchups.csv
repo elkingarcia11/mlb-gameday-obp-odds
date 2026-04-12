@@ -1,0 +1,13 @@
+game_pk,team,opponent,obp,opponent_obp,matchup,odds,results
+823884,Miami Marlins,Cincinnati Reds,0.340,0.290,0.0500,favorite,W
+823645,New York Mets,Arizona Diamondbacks,0.324,0.284,0.0400,favorite,L
+823565,New York Yankees,Athletics,0.330,0.296,0.0340,favorite,L
+824130,Kansas City Royals,Chicago White Sox,0.321,0.291,0.0300,favorite,L
+823319,Colorado Rockies,San Diego Padres,0.307,0.282,0.0250,not favorite,L
+823724,Detroit Tigers,Minnesota Twins,0.330,0.325,0.0050,favorite,L
+823724,Minnesota Twins,Detroit Tigers,0.325,0.330,-0.0050,not favorite,W
+823319,San Diego Padres,Colorado Rockies,0.282,0.307,-0.0250,favorite,W
+824130,Chicago White Sox,Kansas City Royals,0.291,0.321,-0.0300,not favorite,W
+823565,Athletics,New York Yankees,0.296,0.330,-0.0340,not favorite,W
+823645,Arizona Diamondbacks,New York Mets,0.284,0.324,-0.0400,not favorite,W
+823884,Cincinnati Reds,Miami Marlins,0.290,0.340,-0.0500,not favorite,L

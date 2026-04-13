@@ -13,8 +13,13 @@ Win rate is **W / (W+L)** only; ties and blank results are counted but excluded
 from that denominator.
 
 Writes ``data/results/historic_matchup_odds_results.csv`` and ``.txt`` by default.
-Unless ``--no-plot`` is passed, also writes ``data/results/historic_matchup_odds_results.png``
-(2D heatmap; requires matplotlib).
+Unless ``--no-plot`` is passed, also writes:
+
+- ``data/results/historic_matchup_odds_results.png`` — heatmap of win rate by odds
+  role × matchup sign (requires matplotlib).
+- ``data/results/historic_matchup_spread_winrate.png`` — win rate vs **numeric**
+  ``matchup`` (OBP spread) in bins, separate lines for favorite vs not favorite.
+- ``data/results/historic_matchup_spread_by_odds.csv`` — tabular data for that chart.
 """
 
 from __future__ import annotations
@@ -90,11 +95,17 @@ def _add_outcome(b: Bucket, res: str) -> None:
 
 def _collect(
     data_dir: Path,
-) -> tuple[dict[tuple[str, str], Bucket], int, list[str]]:
+) -> tuple[dict[tuple[str, str], Bucket], dict[tuple[str, int], Bucket], int, list[str]]:
     """
-    Returns ((odds_role, edge_bucket) -> Bucket, rows_in_usable_files, missing_results_files).
+    Returns (
+        (odds_role, edge_bucket) -> Bucket,
+        (odds_role, spread_bin_index) -> Bucket for favorite / not_favorite only,
+        rows_in_usable_files,
+        missing_results_files,
+    ).
     """
     grid: dict[tuple[str, str], Bucket] = defaultdict(Bucket)
+    spread_bins: dict[tuple[str, int], Bucket] = defaultdict(Bucket)
     rows_in_usable_files = 0
     missing_results: list[str] = []
 
@@ -111,11 +122,15 @@ def _collect(
             for row in reader:
                 rows_in_usable_files += 1
                 role = _odds_role(row.get("odds", ""))
-                edge = _edge_bucket(_parse_matchup(row.get("matchup", "")))
+                mu = _parse_matchup(row.get("matchup", ""))
+                edge = _edge_bucket(mu)
                 res = _parse_result(row.get("results", ""))
                 _add_outcome(grid[(role, edge)], res)
+                if role in ODDS_ORDER_PRIMARY and mu is not None:
+                    sb = _matchup_spread_bin_index(mu)
+                    _add_outcome(spread_bins[(role, sb)], res)
 
-    return dict(grid), rows_in_usable_files, missing_results
+    return dict(grid), dict(spread_bins), rows_in_usable_files, missing_results
 
 
 def _rate(b: Bucket) -> str:
@@ -138,6 +153,37 @@ EDGE_LABEL = {
 
 EDGE_ORDER = ("lt0", "eq0", "gt0", "unknown")
 ODDS_ORDER_PRIMARY = ("favorite", "not_favorite")
+
+# Ascending OBP spread (matchup) bin boundaries. Bin i is
+# (-inf, b0), [b0,b1), …, [b_{k-1}, +inf) with k = len(_SPREAD_BREAKS) + 1.
+_SPREAD_BREAKS = [-0.05, -0.03, -0.02, -0.01, 0.0, 0.01, 0.02, 0.03, 0.05]
+
+
+def _matchup_spread_bin_index(mu: float) -> int:
+    if mu < _SPREAD_BREAKS[0]:
+        return 0
+    for i in range(1, len(_SPREAD_BREAKS)):
+        if mu < _SPREAD_BREAKS[i]:
+            return i
+    return len(_SPREAD_BREAKS)
+
+
+def _matchup_spread_bin_bounds(i: int) -> tuple[str, float]:
+    """Return (label, x_center_for_plot) for bin index i."""
+    k = len(_SPREAD_BREAKS)
+    if i == 0:
+        lo, hi = float("-inf"), _SPREAD_BREAKS[0]
+        label = f"matchup < {_SPREAD_BREAKS[0]:.2f}"
+        xc = _SPREAD_BREAKS[0] - 0.015
+    elif i == k:
+        lo, hi = _SPREAD_BREAKS[-1], float("inf")
+        label = f"matchup ≥ {_SPREAD_BREAKS[-1]:.2f}"
+        xc = _SPREAD_BREAKS[-1] + 0.015
+    else:
+        lo, hi = _SPREAD_BREAKS[i - 1], _SPREAD_BREAKS[i]
+        label = f"[{lo:.2f}, {hi:.2f})"
+        xc = (lo + hi) / 2
+    return label, xc
 
 
 def _iter_rows(grid: dict[tuple[str, str], Bucket]) -> list[tuple[str, str, Bucket]]:
@@ -183,7 +229,15 @@ def _write_csv(path: Path, grid: dict[tuple[str, str], Bucket]) -> None:
             )
 
 
-def _write_txt(path: Path, grid: dict[tuple[str, str], Bucket], meta_lines: list[str]) -> None:
+def _write_txt(
+    path: Path,
+    grid: dict[tuple[str, str], Bucket],
+    meta_lines: list[str],
+    spread_bins: dict[tuple[str, int], Bucket],
+    *,
+    spread_csv: Path,
+    spread_png: Path,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         "Historic analysis: odds role (favorite / not favorite) × matchup sign vs results",
@@ -201,7 +255,71 @@ def _write_txt(path: Path, grid: dict[tuple[str, str], Bucket], meta_lines: list
             f"  decided (W+L only): {b.decided()}  win rate (W / (W+L)): {_rate(b) or 'n/a'}"
         )
         lines.append("")
+
+    n_bins = len(_SPREAD_BREAKS) + 1
+    lines.extend(
+        [
+            "",
+            "=" * 72,
+            "OBP spread (numeric matchup) vs results — by moneyline favorite / not favorite",
+            f"Full table (open in a spreadsheet): {spread_csv}",
+            f"Line chart (win rate vs spread bins): {spread_png}",
+            "",
+        ]
+    )
+    for role in ODDS_ORDER_PRIMARY:
+        lines.append(ODDS_LABEL.get(role, role))
+        for i in range(n_bins):
+            b = spread_bins.get((role, i)) or Bucket()
+            if b.wins + b.losses + b.ties + b.no_result == 0:
+                continue
+            label, _xc = _matchup_spread_bin_bounds(i)
+            lines.append(f"  {label}")
+            lines.append(
+                f"    wins: {b.wins}  losses: {b.losses}  ties: {b.ties}  "
+                f"decided (W+L): {b.decided()}  win rate: {_rate(b) or 'n/a'}"
+            )
+        lines.append("")
+
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def _write_spread_csv(path: Path, spread_bins: dict[tuple[str, int], Bucket]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n_bins = len(_SPREAD_BREAKS) + 1
+    fieldnames = [
+        "odds_role",
+        "spread_bin_index",
+        "spread_bin_label",
+        "plot_x_matchup_center",
+        "wins",
+        "losses",
+        "ties",
+        "no_result",
+        "decided_games",
+        "win_rate_wl_only",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for role in ODDS_ORDER_PRIMARY:
+            for i in range(n_bins):
+                b = spread_bins.get((role, i)) or Bucket()
+                label, xc = _matchup_spread_bin_bounds(i)
+                w.writerow(
+                    {
+                        "odds_role": role,
+                        "spread_bin_index": i,
+                        "spread_bin_label": label,
+                        "plot_x_matchup_center": f"{xc:.5f}",
+                        "wins": b.wins,
+                        "losses": b.losses,
+                        "ties": b.ties,
+                        "no_result": b.no_result,
+                        "decided_games": b.decided(),
+                        "win_rate_wl_only": _rate(b),
+                    }
+                )
 
 
 def _rdylgn_cmap(plt):
@@ -284,6 +402,79 @@ def _write_plot(
     plt.close(fig)
 
 
+def _write_spread_plot(
+    path: Path,
+    spread_bins: dict[tuple[str, int], Bucket],
+    meta_lines: list[str],
+) -> None:
+    import matplotlib.pyplot as plt
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n_bins = len(_SPREAD_BREAKS) + 1
+    xs: list[float] = []
+    for i in range(n_bins):
+        _, xc = _matchup_spread_bin_bounds(i)
+        xs.append(xc)
+
+    fig, ax = plt.subplots(figsize=(9.5, 4.8))
+    styles = {
+        "favorite": {"color": "#1a5276", "marker": "o", "label": "Moneyline favorite"},
+        "not_favorite": {"color": "#922b21", "marker": "s", "label": "Not favorite"},
+    }
+    for role in ODDS_ORDER_PRIMARY:
+        ys: list[float] = []
+        ns: list[int] = []
+        for i in range(n_bins):
+            b = spread_bins.get((role, i)) or Bucket()
+            wr = b.win_rate()
+            ys.append(float(wr) if wr is not None else float("nan"))
+            ns.append(b.decided())
+        st = styles[role]
+        ax.plot(
+            xs,
+            ys,
+            color=st["color"],
+            marker=st["marker"],
+            linewidth=2,
+            markersize=7,
+            label=st["label"],
+        )
+        for x, y, n in zip(xs, ys, ns, strict=True):
+            if n > 0 and y == y:
+                ax.annotate(
+                    f"n={n}",
+                    (x, y),
+                    textcoords="offset points",
+                    xytext=(0, 8),
+                    ha="center",
+                    fontsize=7,
+                    color=st["color"],
+                )
+
+    ax.axhline(0.5, color="#888888", linestyle="--", linewidth=1, label="50%")
+    ax.set_xlabel("OBP spread (matchup = team OBP − opponent OBP); bin centers for tails")
+    ax.set_ylabel("Win probability W / (W+L)")
+    ax.set_title(
+        "How OBP spread relates to winning (by moneyline side)\n"
+        "Historic team-rows with results; wider bins when n is small",
+        fontsize=11,
+    )
+    ax.set_ylim(-0.02, 1.02)
+    ax.legend(loc="best", fontsize=9)
+    ax.grid(True, alpha=0.3)
+    fig.text(
+        0.01,
+        0.01,
+        "\n".join(meta_lines),
+        fontsize=7,
+        color="#444444",
+        va="bottom",
+    )
+    fig.subplots_adjust(bottom=0.22, left=0.1, right=0.97, top=0.86)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def run(
     data_dir: Path,
     out_csv: Path,
@@ -292,8 +483,10 @@ def run(
     *,
     plot: bool,
     out_png: Path,
+    out_csv_spread: Path,
+    out_png_spread: Path,
 ) -> None:
-    grid, rows_scanned, missing = _collect(data_dir)
+    grid, spread_bins, rows_scanned, missing = _collect(data_dir)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     meta = {
         "generated_utc": now,
@@ -306,16 +499,29 @@ def run(
     if "csv" in formats:
         _write_csv(out_csv, grid)
         print(f"Wrote {out_csv}")
+        _write_spread_csv(out_csv_spread, spread_bins)
+        print(f"Wrote {out_csv_spread}")
     if "txt" in formats:
-        _write_txt(out_txt, grid, meta_lines)
+        _write_txt(
+            out_txt,
+            grid,
+            meta_lines,
+            spread_bins,
+            spread_csv=out_csv_spread,
+            spread_png=out_png_spread,
+        )
         print(f"Wrote {out_txt}")
     for line in meta_lines:
         print(line)
+    print(f"Binned spread table: {out_csv_spread}")
+    print(f"Binned spread chart:  {out_png_spread}")
 
     if plot:
         try:
             _write_plot(out_png, grid, meta_lines)
             print(f"Wrote {out_png}")
+            _write_spread_plot(out_png_spread, spread_bins, meta_lines)
+            print(f"Wrote {out_png_spread}")
         except ImportError as e:
             print(
                 "Skipping PNG (matplotlib not installed). From the project root run:\n"
@@ -357,6 +563,16 @@ def main() -> None:
         type=Path,
         default=Path("data/results/historic_matchup_odds_results.png"),
     )
+    p.add_argument(
+        "--out-csv-spread",
+        type=Path,
+        default=Path("data/results/historic_matchup_spread_by_odds.csv"),
+    )
+    p.add_argument(
+        "--out-png-spread",
+        type=Path,
+        default=Path("data/results/historic_matchup_spread_winrate.png"),
+    )
     args = p.parse_args()
     if not args.data_dir.is_dir():
         raise SystemExit(f"data directory not found: {args.data_dir}")
@@ -369,6 +585,8 @@ def main() -> None:
         fmt,
         plot=args.plot,
         out_png=args.out_png,
+        out_csv_spread=args.out_csv_spread,
+        out_png_spread=args.out_png_spread,
     )
 
 

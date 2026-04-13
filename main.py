@@ -276,6 +276,8 @@ def main() -> None:
         {"csv", "txt"},
         plot=True,
         out_png=results_dir / "historic_matchup_odds_results.png",
+        out_csv_spread=results_dir / "historic_matchup_spread_by_odds.csv",
+        out_png_spread=results_dir / "historic_matchup_spread_winrate.png",
     )
 
     team_csv = data_dir / f"{today.isoformat()}.csv"

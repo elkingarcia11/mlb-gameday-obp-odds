@@ -1,0 +1,33 @@
+# Builds the Dockerfile and pushes to Artifact Registry.
+# Intended for a Cloud Build trigger on push to GitHub (provides $SHORT_SHA).
+#
+# Before first run: grant the Cloud Build service account
+# roles/artifactregistry.writer on the project (or narrower on this repo).
+#
+# If the trigger runs on branches other than main, remove the :latest tag below
+# so feature branches do not overwrite production.
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+substitutions:
+  _REGION: us-east4
+  _AR_REPO: mlb-gameday-obp-odds
+  _IMAGE_NAME: daily-job
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    env:
+      - DOCKER_BUILDKIT=1
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_IMAGE_NAME}:$SHORT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_IMAGE_NAME}:latest
+      - .
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_IMAGE_NAME}:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_IMAGE_NAME}:latest

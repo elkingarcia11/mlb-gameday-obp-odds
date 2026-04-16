@@ -1,8 +1,6 @@
 """
-MLB gameday odds edge finder: team OBP vs opponents and moneyline favorite labels.
-
-Uses MLB Stats API (statsapi.mlb.com) for OBP and schedule; ESPN game summary
-pickcenter (typically DraftKings) for American moneylines, matched by team names.
+Daily MLB slate: team hitting_obp and pitching_obp (OBP allowed), matchup nets,
+ESPN moneylines. Uses MLB Stats API + ESPN pickcenter (see README).
 """
 
 from __future__ import annotations
@@ -33,37 +31,67 @@ def _parse_obp(raw: str) -> float:
     return float(raw)
 
 
-def fetch_team_obp_by_id(season: int) -> tuple[dict[int, float], list[dict]]:
-    """Returns (team_id -> obp) and rows suitable for CSV."""
+def _fetch_team_obp_map(season: int, group: str) -> dict[int, float]:
     url = (
         f"{STATS_BASE}/teams/stats?"
-        f"season={season}&group=hitting&stats=season&sportId=1"
+        f"season={season}&group={group}&stats=season&sportId=1"
     )
     payload = _fetch_json(url)
     splits = payload["stats"][0]["splits"]
-    by_id: dict[int, float] = {}
-    rows: list[dict] = []
-    for s in splits:
+    return {s["team"]["id"]: _parse_obp(s["stat"]["obp"]) for s in splits}
+
+
+def fetch_team_hitting_and_pitching_obp(
+    season: int,
+) -> tuple[dict[int, float], dict[int, float], list[dict]]:
+    """
+    Returns (team_id -> hitting OBP), (team_id -> pitching OBP allowed to
+    opponents — exposed as pitching_obp in CSVs), and rows for the team snapshot.
+    """
+    hitting_url = (
+        f"{STATS_BASE}/teams/stats?"
+        f"season={season}&group=hitting&stats=season&sportId=1"
+    )
+    payload_h = _fetch_json(hitting_url)
+    splits_h = payload_h["stats"][0]["splits"]
+    hitting: dict[int, float] = {}
+    tid_to_name: dict[int, str] = {}
+    for s in splits_h:
         tid = s["team"]["id"]
-        name = s["team"]["name"]
-        obp = _parse_obp(s["stat"]["obp"])
-        by_id[tid] = obp
-        rows.append({"team_id": tid, "team_name": name, "obp": obp})
-    rows.sort(key=lambda r: r["team_name"])
-    return by_id, rows
+        hitting[tid] = _parse_obp(s["stat"]["obp"])
+        tid_to_name[tid] = s["team"]["name"]
+
+    pitching_allowed = _fetch_team_obp_map(season, "pitching")
+
+    rows: list[dict] = []
+    for tid in sorted(tid_to_name, key=lambda i: tid_to_name[i]):
+        if tid not in pitching_allowed:
+            continue
+        rows.append(
+            {
+                "team_id": tid,
+                "team_name": tid_to_name[tid],
+                "hitting_obp": hitting[tid],
+                "pitching_obp": pitching_allowed[tid],
+            }
+        )
+    return hitting, pitching_allowed, rows
 
 
 def write_team_csv(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["team_id", "team_name", "obp"])
+        w = csv.DictWriter(
+            f, fieldnames=["team_id", "team_name", "hitting_obp", "pitching_obp"]
+        )
         w.writeheader()
         for r in rows:
             w.writerow(
                 {
                     "team_id": r["team_id"],
                     "team_name": r["team_name"],
-                    "obp": f"{r['obp']:.3f}",
+                    "hitting_obp": f"{r['hitting_obp']:.3f}",
+                    "pitching_obp": f"{r['pitching_obp']:.3f}",
                 }
             )
 
@@ -170,7 +198,8 @@ def odds_role(team_ml: int | None, opp_ml: int | None) -> str:
 
 def matchup_rows_for_games(
     games: list[dict],
-    team_obp: dict[int, float],
+    hitting_obp: dict[int, float],
+    pitching_obp: dict[int, float],
     espn_moneylines: dict[frozenset[str], dict[str, int]] | None = None,
 ) -> list[dict]:
     skip = {"Cancelled", "Canceled", "Postponed"}
@@ -182,9 +211,15 @@ def matchup_rows_for_games(
         away = g["teams"]["away"]["team"]
         home = g["teams"]["home"]["team"]
         aid, hid = away["id"], home["id"]
-        if aid not in team_obp or hid not in team_obp:
+        if (
+            aid not in hitting_obp
+            or hid not in hitting_obp
+            or aid not in pitching_obp
+            or hid not in pitching_obp
+        ):
             continue
-        a_obp, h_obp = team_obp[aid], team_obp[hid]
+        a_hit, h_hit = hitting_obp[aid], hitting_obp[hid]
+        a_p, h_p = pitching_obp[aid], pitching_obp[hid]
         a_name, h_name = away["name"], home["name"]
         lines_by_name = _moneylines_for_mlb_game(a_name, h_name, espn_moneylines)
 
@@ -207,9 +242,12 @@ def matchup_rows_for_games(
                 **base,
                 "team": a_name,
                 "opponent": h_name,
-                "obp": a_obp,
-                "opponent_obp": h_obp,
-                "matchup": round(a_obp - h_obp, 4),
+                "hitting_obp": a_hit,
+                "opponent_hitting_obp": h_hit,
+                "pitching_obp": a_p,
+                "opponent_pitching_obp": h_p,
+                "net_hitting_obp": round(a_hit - h_hit, 4),
+                "net_pitching_obp": round(a_p - h_p, 4),
                 "odds": odds_role(a_line, h_line),
             }
         )
@@ -218,13 +256,16 @@ def matchup_rows_for_games(
                 **base,
                 "team": h_name,
                 "opponent": a_name,
-                "obp": h_obp,
-                "opponent_obp": a_obp,
-                "matchup": round(h_obp - a_obp, 4),
+                "hitting_obp": h_hit,
+                "opponent_hitting_obp": a_hit,
+                "pitching_obp": h_p,
+                "opponent_pitching_obp": a_p,
+                "net_hitting_obp": round(h_hit - a_hit, 4),
+                "net_pitching_obp": round(h_p - a_p, 4),
                 "odds": odds_role(h_line, a_line),
             }
         )
-    out.sort(key=lambda r: r["matchup"], reverse=True)
+    out.sort(key=lambda r: (-r["net_hitting_obp"], r["net_pitching_obp"]))
     return out
 
 
@@ -234,9 +275,12 @@ def write_matchup_csv(path: Path, rows: list[dict]) -> None:
         "game_pk",
         "team",
         "opponent",
-        "obp",
-        "opponent_obp",
-        "matchup",
+        "hitting_obp",
+        "opponent_hitting_obp",
+        "pitching_obp",
+        "opponent_pitching_obp",
+        "net_hitting_obp",
+        "net_pitching_obp",
         "odds",
     ]
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -248,9 +292,12 @@ def write_matchup_csv(path: Path, rows: list[dict]) -> None:
                     "game_pk": r["game_pk"],
                     "team": r["team"],
                     "opponent": r["opponent"],
-                    "obp": f"{r['obp']:.3f}",
-                    "opponent_obp": f"{r['opponent_obp']:.3f}",
-                    "matchup": f"{r['matchup']:.4f}",
+                    "hitting_obp": f"{r['hitting_obp']:.3f}",
+                    "opponent_hitting_obp": f"{r['opponent_hitting_obp']:.3f}",
+                    "pitching_obp": f"{r['pitching_obp']:.3f}",
+                    "opponent_pitching_obp": f"{r['opponent_pitching_obp']:.3f}",
+                    "net_hitting_obp": f"{r['net_hitting_obp']:.4f}",
+                    "net_pitching_obp": f"{r['net_pitching_obp']:.4f}",
                     "odds": r["odds"],
                 }
             )
@@ -283,16 +330,21 @@ def main() -> None:
     team_csv = data_dir / f"{today.isoformat()}.csv"
     matchup_csv = data_dir / f"{today.isoformat()}_matchups.csv"
 
-    team_obp, team_rows = fetch_team_obp_by_id(season)
+    hitting_obp, pitching_obp_map, team_rows = fetch_team_hitting_and_pitching_obp(
+        season
+    )
     write_team_csv(team_csv, team_rows)
 
     games = fetch_schedule_games(today)
     espn_ml = fetch_espn_moneylines_by_team_pair(today)
-    matchup_rows = matchup_rows_for_games(games, team_obp, espn_ml)
+    matchup_rows = matchup_rows_for_games(games, hitting_obp, pitching_obp_map, espn_ml)
     write_matchup_csv(matchup_csv, matchup_rows)
 
     print(f"Wrote {team_csv} ({len(team_rows)} teams)")
-    print(f"Wrote {matchup_csv} ({len(matchup_rows)} team-sides, sorted by matchup)")
+    print(
+        f"Wrote {matchup_csv} ({len(matchup_rows)} team-sides, "
+        "sorted by net_hitting_obp desc, then net_pitching_obp asc)"
+    )
 
 
 if __name__ == "__main__":

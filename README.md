@@ -1,44 +1,60 @@
-# MLB gameday odds edge finder
+# MLB gameday — hitting & pitching OBP vs moneylines
 
-**mlb-gameday-odds-edge-finder** is a small Python project that:
+**Repository:** `mlb-gameday-obp-odds` (local folder / GitHub repo name)
 
-- loads each club’s **season OBP** and **today’s schedule** from the **MLB Stats API**;
-- writes matchup CSVs with **OBP edge** (`matchup` = team OBP minus opponent OBP); and
-- labels each team-side as **`favorite`**, **`not favorite`**, **`equal`**, or **`unknown`** using **American moneylines** from **ESPN** (via the scoreboard + game summary `pickcenter`).
+A small Python tool that pulls **MLB Stats API** team rates and **today’s** schedule, **ESPN** moneylines for the slate, and writes **matchup CSVs** with **hitting edge**, **pitching edge** (OBP allowed), and **favorite / not favorite** labels. Past slates can be **backfilled** with **W / L / T**, then **historic analysis** summarizes how those edges and odds line up with **results**.
 
-Running **`main.py`** **backfills** finished games into older `*_matchups.csv` rows (**`results`**: W / L / T), then rebuilds **historic analysis** (CSV, TXT, and optional PNGs under **`data/results/`**), then writes **today’s** team and matchup files.
+Running **`main.py`** backfills finished games into older `*_matchups.csv` rows (`results`), rebuilds **historic analysis** under **`data/results/`**, then writes **today’s** team and matchup files.
 
 ## What it does
 
 ### Daily pipeline (`main.py`)
 
-When you run `main.py`, steps run in this order:
+1. **Backfill results** — Scans `data/*_matchups.csv` for dates **before today**. If a file has no `results` column yet, the script loads that day’s schedule from the **MLB Stats API**, maps each row’s `game_pk` and `team` to **W**, **L**, or **T**, and rewrites the CSV with a trailing **`results`** column. Files that already include `results`, and **today’s** matchup file, are skipped.
+2. **Historic analysis** — Recomputes summaries under **`data/results/`**: moneyline role vs **hitting** edge (sign + binned `net_hitting_obp`), and—when matchup files include **`net_pitching_obp`**—**marginals**, **odds × pitching**, **binned pitching spread**, **hitting × pitching** sign cross-tabs, and an **odds × hitting × pitching** combo grid (CSV; optional PNGs need **matplotlib**, see [Requirements](#requirements)).
+3. **Today’s snapshot** — Team rate CSV (`hitting_obp`, `pitching_obp`) and today’s matchup CSV (no `results` yet for the live slate).
 
-1. **Backfill results** — Scans `data/*_matchups.csv` for dates **before today**. If a file has no `results` column yet, the script loads that day’s schedule from the **MLB Stats API**, maps each row’s `game_pk` and `team` to **W**, **L**, or **T** (ties), and rewrites the CSV with a trailing **`results`** column. Files that already include `results`, and **today’s** matchup file, are left unchanged by this step.
-2. **Historic analysis** — Recomputes summaries under **`data/results/`**: a cross-tab of **moneyline role** (`odds`: favorite vs not favorite vs other) × **OBP edge sign** (`matchup` &lt; 0, = 0, &gt; 0, or unparsable) vs **`results`** (CSV, TXT, heatmap PNG); a **binned OBP spread** table and **line-chart PNG** of win rate vs numeric `matchup` (separate lines for favorite vs not favorite). The PNGs need **matplotlib** (see [Requirements](#requirements)); if matplotlib is missing, CSV/TXT (including the spread table) are still written. The `data/results/` directory is created automatically when those files are written.
-3. **Today’s snapshot** — Same behavior as before: team OBP CSV, today’s matchup CSV (no `results` column yet for the current slate).
+### Stats and matchup columns
 
-### Core matchup logic (unchanged)
+**MLB Stats API** (`https://statsapi.mlb.com/api/v1`):
 
-1. **Team OBP** — Fetches every MLB club’s season hitting OBP from the official **MLB Stats API** (the same backend as [mlb.com team stats](https://www.mlb.com/stats/team/on-base-percentage)).
-2. **Today’s games** — Fetches the schedule for **today’s calendar date** from the same Stats API.
-3. **Matchup file** — For each scheduled game (excluding cancelled/postponed games), it emits **two rows** (away perspective and home perspective). Each row includes:
-   - `obp` / `opponent_obp` — season OBP for that team and its opponent
-   - `matchup` — that team’s OBP minus the opponent’s OBP
-   - `odds` — see below  
-     Rows are **sorted by `matchup` descending** (largest OBP advantage first).
-4. **Betting `odds` column** — Uses ESPN’s scoreboard plus per-game **summary** JSON. The first usable **`pickcenter`** block (often **DraftKings**) supplies away/home **moneylines**. For each row, the script compares this team’s line to the opponent’s (American odds):
-   - **`favorite`** — this team’s number is **less than** the opponent’s (e.g. `-150` vs `+130`)
-   - **`not favorite`** — this team’s number is **greater** than the opponent’s
-   - **`equal`** — same line
-   - **`unknown`** — no moneylines available or the game couldn’t be matched to ESPN’s slate
+- **`group=hitting`** — each team’s season **batting** OBP (same idea as [mlb.com team hitting OBP](https://www.mlb.com/stats/team/on-base-percentage)).
+- **`group=pitching`** — each team’s **`obp`** is **OBP allowed to all opposing hitters** that season (staff/defense line, not the lineup’s OBP).
 
-Games are matched to ESPN by the **pair of team names** (with a simple normalized-name fallback if wording differs slightly).
+**`data/YYYY-MM-DD.csv`** (one row per team):
+
+| Column         | Meaning |
+| -------------- | ------- |
+| `team_id`      | MLB club id |
+| `team_name`    | Club name |
+| `hitting_obp`  | Season batting OBP |
+| `pitching_obp` | Season OBP **allowed** (pitching group stat) |
+
+**`data/YYYY-MM-DD_matchups.csv`** (two rows per scheduled game — away and home team-sides; cancelled/postponed games omitted):
+
+| Column                     | Meaning |
+| -------------------------- | ------- |
+| `game_pk`                  | MLB game id |
+| `team` / `opponent`        | This row’s club and opponent |
+| `hitting_obp`              | This team’s season batting OBP |
+| `opponent_hitting_obp`     | Opponent’s season batting OBP |
+| `pitching_obp`             | This team’s season OBP **allowed** |
+| `opponent_pitching_obp`    | Opponent’s season OBP **allowed** |
+| `net_hitting_obp`          | `hitting_obp − opponent_hitting_obp` (**higher** = better lineup edge) |
+| `net_pitching_obp`         | `pitching_obp − opponent_pitching_obp` (**lower / more negative** = you allow less OBP than they do = better staff edge) |
+| `odds`                     | `favorite` / `not favorite` / `equal` / `unknown` (see below) |
+| `results`                  | After backfill on past dates: `W` / `L` / `T` or blank |
+
+Rows are sorted by **`net_hitting_obp` descending**, then **`net_pitching_obp` ascending** (stronger hitting edge first; for ties, lean toward the better relative pitching number).
+
+**Betting `odds`** — ESPN scoreboard + per-game **summary** `pickcenter` (often **DraftKings**). American moneylines: **`favorite`** if this team’s line is **less than** the opponent’s (e.g. `-150` vs `+130`), **`not favorite`** if greater, **`equal`** if tied, **`unknown`** if missing or the game could not be matched by team names.
+
+Older matchup CSVs may still use legacy columns (`obp`, `opponent_obp`, `matchup`). Historic analysis prefers **`net_hitting_obp`** when present, else **`matchup`**, for hitting-edge charts.
 
 ## Requirements
 
-- **Python 3.10+** for `main.py`, `backfill_matchup_results.py`, and the analysis script (standard library plus `urllib`; modern type syntax).
-- **Optional (for the historic PNG):** **matplotlib**, listed in `requirements.txt`. On macOS/Homebrew Python (**PEP 668**), install into a **virtual environment** rather than the system interpreter:
+- **Python 3.10+** for `main.py`, `backfill_matchup_results.py`, and the analysis script (stdlib + `urllib`).
+- **Optional (PNGs):** **matplotlib** in `requirements.txt`. On macOS/Homebrew Python (**PEP 668**), use a venv:
 
   ```bash
   python3 -m venv .venv
@@ -52,53 +68,73 @@ The repository **`.gitignore`** ignores `.venv/`.
 
 ### Full daily run (recommended)
 
-From the project directory, using the venv if you want charts:
-
 ```bash
 .venv/bin/python main.py
 ```
 
-Or with system Python (CSV/TXT analysis still runs; PNG is skipped if matplotlib is not installed):
-
-```bash
-python3 main.py
-```
+or `python3 main.py` (PNGs skipped if matplotlib is missing).
 
 The script uses **today’s date** on your machine for the schedule, season year, and output filenames.
 
 ### Standalone utilities
 
-| Script                          | Purpose                                                                                                                                                                                                                                         |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `backfill_matchup_results.py`   | Only backfills `results` on past `data/YYYY-MM-DD_matchups.csv` files (same rules as step 1 in `main.py`). Run from project root: `python3 backfill_matchup_results.py`                                                                         |
-| `analyze_historic_favorites.py` | Rebuilds historic summaries and charts under `data/results/` (see table below). Flags: `--out-csv`, `--out-txt`, `--out-png`, `--out-csv-spread`, `--out-png-spread`; `--no-plot` skips both PNGs. Run: `python3 analyze_historic_favorites.py` |
+| Script | Purpose |
+| ------ | ------- |
+| `backfill_matchup_results.py` | Backfill `results` only on past `data/YYYY-MM-DD_matchups.csv` (same rules as step 1). `python3 backfill_matchup_results.py` |
+| `analyze_historic_favorites.py` | Rebuild historic tables/charts under `data/results/`. Flags: `--out-csv`, `--out-txt`, `--out-png`, `--out-csv-spread`, `--out-png-spread`; `--no-plot` skips PNGs. `python3 analyze_historic_favorites.py` |
+| `verify_matchup_data.py` | Checks internal math (`net_hitting_obp`, `net_pitching_obp`, or legacy `matchup`), two rows per `game_pk`, W/L/T consistency, and odds pairs. `--api-sample N` spot-checks `results` vs the API. `python3 verify_matchup_data.py` |
+
+## Verifying data
+
+Run **`python3 verify_matchup_data.py`** on your `data/` tree.
+
+- **New schema:** `net_hitting_obp ≈ hitting_obp − opponent_hitting_obp` and `net_pitching_obp ≈ pitching_obp − opponent_pitching_obp`.
+- **Legacy schema:** `matchup ≈ obp − opponent_obp` (older files only).
+- Each `game_pk` should have **two** rows; **W/L** (or **T/T**) should be consistent; **`favorite` / `not favorite`** pairs should be coherent.
+
+It no longer requires the two `matchup` / net values to be exact opposites (that was only true when both sides used the same hitting-minus-hitting construction).
 
 ## Output files
 
-Daily team and matchup CSVs live under `data/`. **All** historic analysis outputs (including the **spread** table and chart) live under **`data/results/`** unless you override paths on the analysis script. If you still see `historic_matchup_*` files directly under `data/`, those are from an older layout and are not updated by the current script.
+Daily CSVs live under **`data/`**. Historic analysis defaults to **`data/results/`**.
 
-| File                                               | Contents                                                                                                                                                                                               |
-| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `data/YYYY-MM-DD.csv`                              | All teams: `team_id`, `team_name`, `obp`                                                                                                                                                               |
-| `data/YYYY-MM-DD_matchups.csv`                     | One row per team per game: `game_pk`, `team`, `opponent`, `obp`, `opponent_obp`, `matchup`, `odds`. Past dates, after backfill, also include **`results`** (`W` / `L` / `T`, or blank if unavailable). |
-| `data/results/historic_matchup_odds_results.csv`   | Cross-tab: **`odds_role`** × **`matchup_sign`** with wins, losses, ties, no-result counts, decided games, and **win_rate_wl_only** (W / (W+L)).                                                        |
-| `data/results/historic_matchup_odds_results.txt`   | Human-readable version of the same aggregates (non-empty buckets only).                                                                                                                                |
-| `data/results/historic_matchup_odds_results.png`   | Heatmap of win rate by favorite vs not favorite (rows) and matchup sign (columns). Requires matplotlib.                                                                                                |
-| `data/results/historic_matchup_spread_by_odds.csv` | Win rate by **numeric** `matchup` bins (OBP spread) and **favorite** vs **not_favorite** only; includes bin labels, plot x-centers, counts, and **win_rate_wl_only**.                                  |
-| `data/results/historic_matchup_spread_winrate.png` | Line chart: same binned spread on the x-axis (approximate bin centers), win rate on the y-axis, two series (favorite vs not favorite), **n=** per point. Requires matplotlib.                          |
+### Daily
 
-`game_pk` is the MLB Stats API game identifier (useful if two games share the same matchup on a doubleheader day).
+| File | Contents |
+| ---- | -------- |
+| `data/YYYY-MM-DD.csv` | `team_id`, `team_name`, `hitting_obp`, `pitching_obp` |
+| `data/YYYY-MM-DD_matchups.csv` | `game_pk`, `team`, `opponent`, hitting/pitching raw + opponent columns, `net_hitting_obp`, `net_pitching_obp`, `odds`; past dates add **`results`** after backfill |
+
+### Historic (`data/results/`)
+
+| File | Contents |
+| ---- | -------- |
+| `historic_matchup_odds_results.csv` | Cross-tab: **`odds_role`** × **hitting edge sign** (`matchup_sign` column name kept for compatibility), win rates |
+| `historic_matchup_odds_results.txt` | Summary text + pointers to other outputs |
+| `historic_matchup_odds_results.png` | Heatmap: moneyline side × hitting edge sign |
+| `historic_matchup_spread_by_odds.csv` | Binned **`net_hitting_obp`** (or legacy `matchup`) × favorite / not_favorite |
+| `historic_matchup_spread_winrate.png` | Heatmap for that table |
+| `historic_marginals_by_bucket.csv` | Win rates for **`odds` alone**, **hitting sign alone**, **pitching sign alone** (pitching block only if any input file has `net_pitching_obp`) |
+| `historic_odds_vs_pitching_sign.csv` / `.png` | Moneyline × **pitching** edge sign |
+| `historic_pitching_spread_by_odds.csv` / `historic_pitching_spread_winrate.png` | Binned **`net_pitching_obp`** × moneyline side |
+| `historic_hitting_x_pitching_sign.csv` / `.png` | 4×4 **hitting × pitching** sign buckets (all moneyline roles combined) |
+| `historic_odds_hitting_pitching_combo.csv` | Full **odds × hitting × pitching** sign grid |
+
+If no matchup file includes **`net_pitching_obp`**, pitching-specific and combo artifacts are skipped; hitting-only outputs still run.
+
+`game_pk` is the MLB Stats API game identifier.
 
 ## Data sources
 
-- **MLB:** `https://statsapi.mlb.com/api/v1` (team hitting stats, schedule — including final scores for backfill)
-- **ESPN:** public MLB scoreboard and game summary endpoints (moneylines in `pickcenter`)
+- **MLB:** `https://statsapi.mlb.com/api/v1` (team hitting + pitching stats, schedule / final lines for backfill)
+- **ESPN:** public MLB scoreboard and game summary (`pickcenter` moneylines)
 
 ## Caveats
 
-- OBP is **season-to-date** from the Stats API, not a projection or ballpark-adjusted figure.
-- Moneylines are **one sportsbook row** from ESPN’s feed, not a market consensus.
-- ESPN may omit `pickcenter` for some games; those rows get **`odds` = `unknown`**.
-- The script performs **one HTTP request per ESPN game** on the slate for that day to read summary odds (fine for a daily run, not ideal for tight loops).
-- **Historic analysis** is only as complete as the number of past `*_matchups.csv` files that already include a **`results`** column; until a calendar day has finished and been backfilled, that day does not contribute to the aggregates.
-- **Spread chart** bins are fixed (`analyze_historic_favorites.py`); with few games, some bins will be empty or noisy. The chart is descriptive, not a fitted model of win probability.
+- All OBP figures are **season-to-date** snapshots from the day the data was fetched, not restated when you backfill **`results`** later.
+- **`net_hitting_obp`** and **`net_pitching_obp`** compare **whole-season** team rates, not the specific opponent’s lineup or starter that day.
+- Moneylines are **one** sportsbook row from ESPN, not a consensus.
+- ESPN may omit `pickcenter` for some games → **`odds` = `unknown`**.
+- One **HTTP request per ESPN game** on the slate for summary odds (fine for a daily run).
+- Historic samples depend on how many dated `*_matchups.csv` files include **`results`**.
+- Heatmap bins are fixed; small **`n`** per cell means noisy win rates—descriptive only, not a calibrated model.

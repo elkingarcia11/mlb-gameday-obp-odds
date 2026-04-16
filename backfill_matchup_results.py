@@ -1,8 +1,8 @@
 """
 Backfill a `results` column (W / L / T) into historical `data/YYYY-MM-DD_matchups.csv`.
 
-Skips files whose header already includes `results`, and skips the calendar day of
-"today" so the live slate is left unchanged. Uses MLB Stats API schedule data
+Skips files whose header already includes `results`, and skips the US Eastern
+calendar day of "today" so the live slate is left unchanged. Uses MLB Stats API schedule data
 (same source as main.py).
 """
 
@@ -13,7 +13,7 @@ import re
 from datetime import date
 from pathlib import Path
 
-from main import _norm_team_name, fetch_schedule_games
+from main import _norm_team_name, eastern_date_today, fetch_schedule_games
 
 DATE_STEM = re.compile(r"^(\d{4}-\d{2}-\d{2})_matchups\.csv$")
 
@@ -73,7 +73,7 @@ def _matchup_files(data_dir: Path) -> list[tuple[date, Path]]:
 
 
 def backfill(data_dir: Path, today: date | None = None) -> None:
-    today = today or date.today()
+    today = today or eastern_date_today()
     for on, path in _matchup_files(data_dir):
         if on >= today:
             continue

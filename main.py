@@ -5,11 +5,17 @@ ESPN moneylines. Uses MLB Stats API + ESPN pickcenter (see README).
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
+import os
 import re
-from datetime import date
+import shutil
+import sys
+import tempfile
+from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
@@ -20,6 +26,14 @@ ESPN_SCOREBOARD = (
 ESPN_SUMMARY = (
     "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/summary"
 )
+
+# US Eastern — MLB slate and dated output files follow this calendar day.
+_EASTERN_TZ = ZoneInfo("America/New_York")
+
+
+def eastern_date_today() -> date:
+    """Current calendar date in America/New_York (EST/EDT)."""
+    return datetime.now(_EASTERN_TZ).date()
 
 
 def _fetch_json(url: str) -> dict | list:
@@ -303,10 +317,9 @@ def write_matchup_csv(path: Path, rows: list[dict]) -> None:
             )
 
 
-def main() -> None:
-    today = date.today()
+def run_pipeline(data_dir: Path, today: date | None = None) -> None:
+    today = today or eastern_date_today()
     season = today.year
-    data_dir = Path("data")
 
     # Backfill W/L/T on past matchup CSVs before writing today's files.
     from backfill_matchup_results import backfill
@@ -345,6 +358,53 @@ def main() -> None:
         f"Wrote {matchup_csv} ({len(matchup_rows)} team-sides, "
         "sorted by net_hitting_obp desc, then net_pitching_obp asc)"
     )
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--storage",
+        choices=("local", "gcs"),
+        default="local",
+        help="local: read/write ./data. gcs: sync data/ prefix from/to a bucket.",
+    )
+    p.add_argument(
+        "--gcs-bucket",
+        default=os.environ.get("GCS_BUCKET", ""),
+        metavar="NAME",
+        help="GCS bucket name (required for --storage gcs; else env GCS_BUCKET).",
+    )
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
+    if args.storage == "local":
+        run_pipeline(Path("data"))
+        return
+
+    bucket = (args.gcs_bucket or "").strip()
+    if not bucket:
+        print(
+            "--gcs-bucket or GCS_BUCKET is required when --storage gcs",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    from gcs_sync import download_data_prefix, upload_data_tree
+
+    tmp = Path(tempfile.mkdtemp(prefix="mlb-gameday-data-"))
+    data_dir = tmp / "data"
+    data_dir.mkdir(parents=True)
+    try:
+        download_data_prefix(bucket, data_dir)
+        run_pipeline(data_dir)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    upload_data_tree(bucket, data_dir)
+    shutil.rmtree(tmp, ignore_errors=True)
+    print(f"Synced data/ to gs://{bucket}/data/")
 
 
 if __name__ == "__main__":

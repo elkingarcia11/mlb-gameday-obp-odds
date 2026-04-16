@@ -103,9 +103,9 @@ The **`Dockerfile`** is meant for **Cloud Run Jobs**: one container runs **`pyth
 
 Repository root **`cloudbuild.yaml`** defines a **Cloud Build** pipeline that builds that Dockerfile and pushes to Artifact Registry on each trigger run (see below).
 
-### Cloud Build: GitHub push → Artifact Registry (recommended)
+### Cloud Build: GitHub trigger → container image
 
-Use a **Cloud Build trigger** so pushes to GitHub build and push the image without using your laptop.
+Pushes to GitHub run **`cloudbuild.yaml`**, which builds the **`Dockerfile`** and pushes the image to **Artifact Registry** (no local Docker or `docker push`).
 
 1. **Enable the [Cloud Build API](https://console.cloud.google.com/apis/library/cloudbuild.googleapis.com)** on your GCP project.
 
@@ -122,13 +122,12 @@ Use a **Cloud Build trigger** so pushes to GitHub build and push the image witho
    - **Event:** Push to a branch.
    - **Branch (regex):** `^main$` is recommended so only **`main`** updates the **`:latest`** tag produced by `cloudbuild.yaml`.
    - **Build configuration:** **Cloud Build configuration file (yaml or json)** — path **`/cloudbuild.yaml`**.
-   - **Substitutions (optional):** in the trigger, you can override **`_REGION`**, **`_AR_REPO`**, or **`_IMAGE_NAME`** if they differ from the defaults in `cloudbuild.yaml`.
+   - **Service account (if asked):** use the **default Cloud Build** service account **`PROJECT_NUMBER@cloudbuild.gserviceaccount.com`**, not unrelated app service accounts.
+   - **Substitutions (optional):** override **`_REGION`**, **`_AR_REPO`**, or **`_IMAGE_NAME`** if they differ from the defaults in `cloudbuild.yaml`.
 
-5. **Push to `main`** (or click **Run** on the trigger). A successful build publishes **`.../daily-job:$SHORT_SHA`** and **`.../daily-job:latest`**. Point the Cloud Run Job at **`...:latest`** for a stable URL that tracks `main`, or pin **`:$SHORT_SHA`** for an exact revision.
+5. **Push to `main`** (or click **Run** on the trigger). A successful build publishes **`REGION-docker.pkg.dev/PROJECT_ID/AR_REPO/daily-job:$SHORT_SHA`** and **`...:latest`** (see `cloudbuild.yaml` for exact region and repo). Use that URI when you configure the Cloud Run Job: **`...:latest`** tracks **`main`**, or pin **`:$SHORT_SHA`** for an exact build.
 
-**If `docker push` fails with `invalid_grant`:** run **`gcloud auth login`** again, then **`gcloud auth configure-docker REGION-docker.pkg.dev`**.
-
-**Test `cloudbuild.yaml` without GitHub** (you must pass **`SHORT_SHA`**; it is set automatically on trigger runs):
+**Optional — test the build from your machine** (GitHub sets **`SHORT_SHA`** automatically; here you pass it yourself):
 
 ```bash
 gcloud builds submit . \
@@ -136,45 +135,9 @@ gcloud builds submit . \
   --substitutions=SHORT_SHA=$(git rev-parse --short HEAD)
 ```
 
-### Artifact Registry: local Docker login (manual pushes only)
-
-Use the [Google Cloud SDK](https://cloud.google.com/sdk) when you still want to push from your machine.
-
-1. **Install and initialize** (if you have not already):
-
-   ```bash
-   gcloud init
-   gcloud auth login
-   ```
-
-2. **Configure Docker** for the Artifact Registry **hostname** for your region. Use only `REGION-docker.pkg.dev` — do **not** append `/project/repo` to this command (that path belongs on `docker build` / `docker push` tags only).
-
-   Example for **`us-east4`**:
-
-   ```bash
-   gcloud auth configure-docker us-east4-docker.pkg.dev
-   ```
-
-   For a different region, substitute its hostname (e.g. `us-east1-docker.pkg.dev`). More detail: [Configure authentication for Docker](https://cloud.google.com/artifact-registry/docs/docker/authentication).
-
-3. **Build and push** the image. Set variables to match your GCP **project**, Artifact Registry **repository id** (from the console), **region**, image name, and tag:
-
-   ```bash
-   PROJECT_ID=elkin-garcia-workspace
-   REGION=us-east4
-   REPO=mlb-gameday-obp-odds
-   IMAGE=daily-job
-   TAG=$(git rev-parse --short HEAD)
-
-   docker build -t "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${IMAGE}:${TAG}" .
-   docker push "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${IMAGE}:${TAG}"
-   ```
-
-   Use that full URI as the container image when you create or update the Cloud Run Job.
-
 ### Cloud Run Job (after the image exists)
 
-1. **Create or update the job** in the Google Cloud console (or `gcloud`): point the job at that image, **one task** (default parallelism is fine for this workload), and a **task timeout** long enough for MLB/ESPN calls, GCS download/upload, and analysis (often **10–15 minutes** is comfortable).
+1. **Create or update the job** in the Google Cloud console (or `gcloud`): set the container image to the Artifact Registry URL produced by Cloud Build (for example **`us-east4-docker.pkg.dev/PROJECT_ID/mlb-gameday-obp-odds/daily-job:latest`** if you use the defaults in `cloudbuild.yaml` and a **`main`**-only trigger). Use **one task** and a **task timeout** long enough for MLB/ESPN calls, GCS download/upload, and analysis (often **10–15 minutes** is comfortable).
 
 2. **Job settings**
    - **Environment variables:** set **`GCS_BUCKET`** to your bucket (same layout as local: objects under **`gs://BUCKET/data/...`**).

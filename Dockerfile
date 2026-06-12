@@ -15,6 +15,6 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py backfill_matchup_results.py analyze_historic_favorites.py gcs_sync.py verify_matchup_data.py ./
+COPY main.py backfill_matchup_results.py analyze_historic_favorites.py analyze_betting_charts.py gcs_sync.py verify_matchup_data.py ./
 
 CMD ["python", "main.py", "--storage", "gcs"]

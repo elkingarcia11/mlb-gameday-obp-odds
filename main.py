@@ -210,6 +210,14 @@ def odds_role(team_ml: int | None, opp_ml: int | None) -> str:
     return "not favorite"
 
 
+def _fmt_moneyline(value: int | None) -> str:
+    if value is None:
+        return ""
+    if value > 0:
+        return f"+{value}"
+    return str(value)
+
+
 def matchup_rows_for_games(
     games: list[dict],
     hitting_obp: dict[int, float],
@@ -262,6 +270,8 @@ def matchup_rows_for_games(
                 "opponent_pitching_obp": h_p,
                 "net_hitting_obp": round(a_hit - h_hit, 4),
                 "net_pitching_obp": round(a_p - h_p, 4),
+                "moneyline": a_line,
+                "opponent_moneyline": h_line,
                 "odds": odds_role(a_line, h_line),
             }
         )
@@ -276,6 +286,8 @@ def matchup_rows_for_games(
                 "opponent_pitching_obp": a_p,
                 "net_hitting_obp": round(h_hit - a_hit, 4),
                 "net_pitching_obp": round(h_p - a_p, 4),
+                "moneyline": h_line,
+                "opponent_moneyline": a_line,
                 "odds": odds_role(h_line, a_line),
             }
         )
@@ -295,6 +307,8 @@ def write_matchup_csv(path: Path, rows: list[dict]) -> None:
         "opponent_pitching_obp",
         "net_hitting_obp",
         "net_pitching_obp",
+        "moneyline",
+        "opponent_moneyline",
         "odds",
     ]
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -312,6 +326,8 @@ def write_matchup_csv(path: Path, rows: list[dict]) -> None:
                     "opponent_pitching_obp": f"{r['opponent_pitching_obp']:.3f}",
                     "net_hitting_obp": f"{r['net_hitting_obp']:.4f}",
                     "net_pitching_obp": f"{r['net_pitching_obp']:.4f}",
+                    "moneyline": _fmt_moneyline(r["moneyline"]),
+                    "opponent_moneyline": _fmt_moneyline(r["opponent_moneyline"]),
                     "odds": r["odds"],
                 }
             )
@@ -339,6 +355,10 @@ def run_pipeline(data_dir: Path, today: date | None = None) -> None:
         out_csv_spread=results_dir / "historic_matchup_spread_by_odds.csv",
         out_png_spread=results_dir / "historic_matchup_spread_winrate.png",
     )
+
+    from analyze_betting_charts import run as run_betting_charts
+
+    run_betting_charts(data_dir, results_dir, plot=True)
 
     team_csv = data_dir / f"{today.isoformat()}.csv"
     matchup_csv = data_dir / f"{today.isoformat()}_matchups.csv"

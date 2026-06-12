@@ -18,10 +18,17 @@ from datetime import date
 from pathlib import Path
 
 from backfill_matchup_results import _result_for_team
-from main import fetch_schedule_games
+from main import fetch_schedule_games, odds_role
 
 DATE_STEM = re.compile(r"^(\d{4}-\d{2}-\d{2})_matchups\.csv$")
 _MATCHUP_TOL = 1e-5
+
+
+def _parse_moneyline(raw: str) -> int | None:
+    s = raw.strip()
+    if not s:
+        return None
+    return int(s.replace("+", ""))
 
 
 def _parse_date_from_matchup_path(path: Path) -> date | None:
@@ -130,7 +137,25 @@ def verify_csv_internal(data_dir: Path) -> list[str]:
                     f"{path.name} game_pk={pk}: unexpected odds pair {oa!r}, {ob!r}"
                 )
 
+            if "moneyline" in lc and "opponent_moneyline" in lc:
+                for row in (ra, rb):
+                    ml = _parse_moneyline(col_from(row, lc, "moneyline"))
+                    oml = _parse_moneyline(col_from(row, lc, "opponent_moneyline"))
+                    expected = odds_role(ml, oml)
+                    actual = (row.get(lc["odds"]) or "").strip().lower()
+                    if actual != expected:
+                        errors.append(
+                            f"{path.name} game_pk={pk} team={row.get('team')!r}: "
+                            f"odds {actual!r} != role from moneylines "
+                            f"({ml}, {oml}) -> {expected!r}"
+                        )
+
     return errors
+
+
+def col_from(row: dict, lc: dict[str, str], name: str) -> str:
+    k = lc.get(name.lower())
+    return (row.get(k) or "").strip() if k else ""
 
 
 def verify_api_sample(data_dir: Path, n_per_file: int) -> list[str]:

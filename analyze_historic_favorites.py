@@ -1,28 +1,17 @@
 """
-Historic matchup CSV analysis: odds, hitting edge, pitching edge vs results.
+Historic matchup CSV analysis: hitting edge and pitching edge vs results (separate).
 
 Reads ``data/YYYY-MM-DD_matchups.csv`` files that include a ``results`` column.
-Produces:
+Hitting and pitching are analyzed in **parallel** — no combined hitting×pitching charts.
 
-- **Marginals** — win rates by ``odds`` alone, ``net_hitting_obp`` sign alone,
-  ``net_pitching_obp`` sign alone (when that column exists).
-- **Odds × hitting** — sign grid + binned ``net_hitting_obp`` (legacy: ``matchup``).
-- **Odds × pitching** — same for ``net_pitching_obp`` when present (negative net
-  pitching OBP = lower OBP allowed than opponent = better staff).
-- **Hitting × pitching** — 4×4 sign buckets (all moneyline roles combined).
-- **Triple** — ``odds`` × hitting sign × pitching sign.
+- **Marginals** — win rates by ``odds`` alone, hitting sign alone, pitching sign alone.
+- **Odds role × edge sign** — favorite / not favorite × hitting or pitching sign.
+- **Binned edge × odds role** — spread bins × favorite / not favorite.
+- **Binned edge × moneyline bucket** — spread bins × ``+150+`` … ``-150+`` (when ``moneyline`` present).
+- **Edge sign × moneyline bucket** — same moneyline buckets × sign.
 
 Win rate is **W / (W+L)** only; ties and blank results are counted but excluded
 from that denominator.
-
-Default outputs under ``data/results/`` (beside ``historic_matchup_odds_results.*``):
-
-- ``historic_marginals_by_bucket.csv`` — odds, hitting sign, pitching sign alone.
-- ``historic_odds_vs_pitching_sign.csv`` / ``.png`` — moneyline × pitching edge sign.
-- ``historic_pitching_spread_by_odds.csv`` / ``historic_pitching_spread_winrate.png``
-  — binned ``net_pitching_obp`` × favorite / not favorite.
-- ``historic_hitting_x_pitching_sign.csv`` / ``.png`` — 4×4 sign cross-tab (all odds).
-- ``historic_odds_hitting_pitching_combo.csv`` — full odds × hitting × pitching grid.
 """
 
 from __future__ import annotations
@@ -58,14 +47,17 @@ class Collected:
     spread_bins_hitting: dict[tuple[str, int], Bucket]
     grid_odds_pitching: dict[tuple[str, str], Bucket]
     spread_bins_pitching: dict[tuple[str, int], Bucket]
-    grid_hit_x_pitch: dict[tuple[str, str], Bucket]
-    grid_odds_hit_pitch: dict[tuple[str, str, str], Bucket]
+    spread_bins_hitting_ml: dict[tuple[int, int], Bucket]
+    spread_bins_pitching_ml: dict[tuple[int, int], Bucket]
+    grid_ml_hitting_sign: dict[tuple[int, str], Bucket]
+    grid_ml_pitching_sign: dict[tuple[int, str], Bucket]
     marginal_odds: dict[str, Bucket]
     marginal_hitting: dict[str, Bucket]
     marginal_pitching: dict[str, Bucket]
     rows_in_usable_files: int
     missing_results: list[str]
     has_pitching_column: bool
+    has_moneyline_column: bool
 
 
 def _parse_float_col(raw: str) -> float | None:
@@ -136,14 +128,17 @@ def _collect(data_dir: Path) -> Collected:
     spread_h: dict[tuple[str, int], Bucket] = defaultdict(Bucket)
     grid_op: dict[tuple[str, str], Bucket] = defaultdict(Bucket)
     spread_p: dict[tuple[str, int], Bucket] = defaultdict(Bucket)
-    grid_hp: dict[tuple[str, str], Bucket] = defaultdict(Bucket)
-    grid_ohp: dict[tuple[str, str, str], Bucket] = defaultdict(Bucket)
+    spread_h_ml: dict[tuple[int, int], Bucket] = defaultdict(Bucket)
+    spread_p_ml: dict[tuple[int, int], Bucket] = defaultdict(Bucket)
+    grid_ml_hit: dict[tuple[int, str], Bucket] = defaultdict(Bucket)
+    grid_ml_pitch: dict[tuple[int, str], Bucket] = defaultdict(Bucket)
     marg_o: dict[str, Bucket] = defaultdict(Bucket)
     marg_h: dict[str, Bucket] = defaultdict(Bucket)
     marg_p: dict[str, Bucket] = defaultdict(Bucket)
     rows_in_usable_files = 0
     missing_results: list[str] = []
     has_pitching_column = False
+    has_moneyline_column = False
 
     paths = sorted(data_dir.glob("*_matchups.csv"))
     for path in paths:
@@ -157,8 +152,11 @@ def _collect(data_dir: Path) -> Collected:
                 continue
             field_lc = {h.strip().lower() for h in fields}
             file_has_pitch = "net_pitching_obp" in field_lc
+            file_has_ml = "moneyline" in field_lc
             if file_has_pitch:
                 has_pitching_column = True
+            if file_has_ml:
+                has_moneyline_column = True
             for row in reader:
                 rows_in_usable_files += 1
                 role = _odds_role(row.get("odds", ""))
@@ -167,12 +165,24 @@ def _collect(data_dir: Path) -> Collected:
                 npv = _spread_pitch_from_row(row, field_lc) if file_has_pitch else None
                 pitch_b = _edge_bucket(npv)
                 res = _parse_result(row.get("results", ""))
+                ml_bin = (
+                    _moneyline_bin_index(_parse_moneyline(_row_get_ci(row, "moneyline")))
+                    if file_has_ml
+                    else None
+                )
 
                 _add_outcome(marg_o[role], res)
                 _add_outcome(marg_h[hit_b], res)
                 _add_outcome(grid_oh[(role, hit_b)], res)
                 if role in ODDS_ORDER_PRIMARY and nh is not None:
                     _add_outcome(spread_h[(role, _matchup_spread_bin_index(nh))], res)
+
+                if ml_bin is not None:
+                    _add_outcome(grid_ml_hit[(ml_bin, hit_b)], res)
+                    if nh is not None:
+                        _add_outcome(
+                            spread_h_ml[(ml_bin, _matchup_spread_bin_index(nh))], res
+                        )
 
                 if npv is not None:
                     _add_outcome(marg_p[pitch_b], res)
@@ -181,23 +191,27 @@ def _collect(data_dir: Path) -> Collected:
                         _add_outcome(
                             spread_p[(role, _matchup_spread_bin_index(npv))], res
                         )
-                if nh is not None and npv is not None:
-                    _add_outcome(grid_hp[(hit_b, pitch_b)], res)
-                    _add_outcome(grid_ohp[(role, hit_b, pitch_b)], res)
-
+                    if ml_bin is not None:
+                        _add_outcome(grid_ml_pitch[(ml_bin, pitch_b)], res)
+                        _add_outcome(
+                            spread_p_ml[(ml_bin, _matchup_spread_bin_index(npv))], res
+                        )
     return Collected(
         grid_odds_hitting=dict(grid_oh),
         spread_bins_hitting=dict(spread_h),
         grid_odds_pitching=dict(grid_op),
         spread_bins_pitching=dict(spread_p),
-        grid_hit_x_pitch=dict(grid_hp),
-        grid_odds_hit_pitch=dict(grid_ohp),
+        spread_bins_hitting_ml=dict(spread_h_ml),
+        spread_bins_pitching_ml=dict(spread_p_ml),
+        grid_ml_hitting_sign=dict(grid_ml_hit),
+        grid_ml_pitching_sign=dict(grid_ml_pitch),
         marginal_odds=dict(marg_o),
         marginal_hitting=dict(marg_h),
         marginal_pitching=dict(marg_p),
         rows_in_usable_files=rows_in_usable_files,
         missing_results=missing_results,
         has_pitching_column=has_pitching_column,
+        has_moneyline_column=has_moneyline_column,
     )
 
 
@@ -233,6 +247,39 @@ ODDS_ORDER_PRIMARY = ("favorite", "not_favorite")
 # Ascending hitting-edge (net_hitting_obp / legacy matchup) bin boundaries. Bin i is
 # (-inf, b0), [b0,b1), …, [b_{k-1}, +inf) with k = len(_SPREAD_BREAKS) + 1.
 _SPREAD_BREAKS = [-0.05, -0.03, -0.02, -0.01, 0.0, 0.01, 0.02, 0.03, 0.05]
+
+# American moneyline buckets (underdog → favorite). Shared with analyze_betting_charts.
+_ML_BUCKET_BOUNDS: list[tuple[int | None, int | None, str]] = [
+    (150, None, "+150+"),
+    (100, 149, "+100 to +149"),
+    (-149, -100, "-100 to -149"),
+    (None, -150, "-150+"),
+]
+ML_BUCKET_ORDER = tuple(range(len(_ML_BUCKET_BOUNDS)))
+
+
+def _parse_moneyline(raw: str) -> int | None:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    try:
+        return int(s.replace("+", ""))
+    except ValueError:
+        return None
+
+
+def _moneyline_bin_index(ml: int) -> int | None:
+    for i, (lo, hi, _label) in enumerate(_ML_BUCKET_BOUNDS):
+        if lo is not None and ml < lo:
+            continue
+        if hi is not None and ml > hi:
+            continue
+        return i
+    return None
+
+
+def _moneyline_bin_label(i: int) -> str:
+    return _ML_BUCKET_BOUNDS[i][2]
 
 
 def _matchup_spread_bin_index(mu: float) -> int:
@@ -316,32 +363,58 @@ def _write_txt(
     spread_pitch_csv: Path,
     spread_pitch_png: Path,
     marginals_csv: Path,
-    combo_csv: Path,
     pitch_sign_csv: Path,
     pitch_sign_png: Path,
-    hit_pitch_csv: Path,
-    hit_pitch_png: Path,
+    hit_spread_ml_csv: Path | None = None,
+    hit_spread_ml_png: Path | None = None,
+    pitch_spread_ml_csv: Path | None = None,
+    pitch_spread_ml_png: Path | None = None,
+    hit_sign_ml_csv: Path | None = None,
+    hit_sign_ml_png: Path | None = None,
+    pitch_sign_ml_csv: Path | None = None,
+    pitch_sign_ml_png: Path | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     grid = c.grid_odds_hitting
     spread_bins = c.spread_bins_hitting
     lines = [
-        "Historic analysis — odds, hitting edge, pitching edge (and combinations) vs results",
+        "Historic analysis — net hitting edge and net pitching edge vs results (separate)",
         "=" * 72,
         *meta_lines,
         "",
         "Output files (CSV / PNG):",
         f"  marginals by bucket: {marginals_csv}",
-        f"  odds × hitting sign CSV: {odds_hit_sign_csv}",
-        f"  odds × hitting spread bins: {spread_hit_csv}  |  heatmap: {spread_hit_png}",
-        f"  odds × pitching sign: {pitch_sign_csv}  |  heatmap: {pitch_sign_png}",
-        f"  odds × pitching spread bins: {spread_pitch_csv}  |  heatmap: {spread_pitch_png}",
-        f"  hitting × pitching signs (all odds): {hit_pitch_csv}  |  heatmap: {hit_pitch_png}",
-        f"  odds × hitting × pitching (full grid): {combo_csv}",
+        f"  odds role × hitting sign: {odds_hit_sign_csv}  |  heatmap: {spread_hit_png}",
+        f"  hitting spread bins × odds role: {spread_hit_csv}",
+        f"  odds role × pitching sign: {pitch_sign_csv}  |  heatmap: {pitch_sign_png}",
+        f"  pitching spread bins × odds role: {spread_pitch_csv}",
+        "",
+    ]
+    if hit_spread_ml_csv is not None:
+        lines.extend(
+            [
+                f"  hitting spread bins × moneyline bucket: {hit_spread_ml_csv}"
+                + (f"  |  heatmap: {hit_spread_ml_png}" if hit_spread_ml_png else ""),
+                f"  hitting sign × moneyline bucket: {hit_sign_ml_csv}"
+                + (f"  |  heatmap: {hit_sign_ml_png}" if hit_sign_ml_png else ""),
+            ]
+        )
+    if pitch_spread_ml_csv is not None:
+        lines.extend(
+            [
+                f"  pitching spread bins × moneyline bucket: {pitch_spread_ml_csv}"
+                + (f"  |  heatmap: {pitch_spread_ml_png}" if pitch_spread_ml_png else ""),
+                f"  pitching sign × moneyline bucket: {pitch_sign_ml_csv}"
+                + (f"  |  heatmap: {pitch_sign_ml_png}" if pitch_sign_ml_png else ""),
+            ]
+        )
+    lines.extend(
+        [
         "",
         "— Odds × hitting edge (sign) —",
         "",
-    ]
+        ]
+    )
     for role, edge, b in _iter_rows(grid):
         if b.wins + b.losses + b.ties + b.no_result == 0:
             continue
@@ -377,7 +450,7 @@ def _write_txt(
         lines.append("")
 
     if c.has_pitching_column:
-        lines.extend(["", "=" * 72, "— Odds × pitching edge (sign) —", ""])
+        lines.extend(["", "=" * 72, "— Odds role × pitching edge (sign) —", ""])
         for role in (*ODDS_ORDER_PRIMARY, "other"):
             for edge in EDGE_ORDER:
                 b = c.grid_odds_pitching.get((role, edge)) or Bucket()
@@ -391,23 +464,29 @@ def _write_txt(
                 )
                 lines.append("")
 
-        lines.extend(["", "=" * 72, "— Hitting × pitching (non-empty cells) —", ""])
-        for he in EDGE_ORDER:
-            for pe in EDGE_ORDER:
-                b = c.grid_hit_x_pitch.get((he, pe)) or Bucket()
-                if b.decided() == 0:
+        lines.extend(
+            ["", "=" * 72, "Pitching edge bins × odds role (favorite / not favorite)", ""]
+        )
+        pitch_spread = c.spread_bins_pitching
+        for role in ODDS_ORDER_PRIMARY:
+            lines.append(ODDS_LABEL.get(role, role))
+            for i in range(n_bins):
+                b = pitch_spread.get((role, i)) or Bucket()
+                if b.wins + b.losses + b.ties + b.no_result == 0:
                     continue
+                label, _xc = _matchup_spread_bin_bounds(i)
+                lines.append(f"  {label}")
                 lines.append(
-                    f"{EDGE_LABEL.get(he, he)}  ×  {PITCH_EDGE_LABEL.get(pe, pe)}"
+                    f"    wins: {b.wins}  losses: {b.losses}  ties: {b.ties}  "
+                    f"decided (W+L): {b.decided()}  win rate: {_rate(b) or 'n/a'}"
                 )
-                lines.append(f"  decided: {b.decided()}  win rate: {_rate(b) or 'n/a'}")
-                lines.append("")
+            lines.append("")
     else:
         lines.extend(
             [
                 "",
                 "=" * 72,
-                "Pitching / combo tables skipped: no net_pitching_obp column in matchup CSVs.",
+                "Pitching tables skipped: no net_pitching_obp column in matchup CSVs.",
                 "",
             ]
         )
@@ -516,6 +595,86 @@ def _write_pitching_spread_csv(path: Path, spread_bins: dict[tuple[str, int], Bu
                         "spread_bin_index": i,
                         "spread_bin_label": label,
                         "plot_x_pitch_edge_center": f"{xc:.5f}",
+                        "wins": b.wins,
+                        "losses": b.losses,
+                        "ties": b.ties,
+                        "no_result": b.no_result,
+                        "decided_games": b.decided(),
+                        "win_rate_wl_only": _rate(b),
+                    }
+                )
+
+
+def _write_spread_ml_csv(
+    path: Path,
+    spread_bins: dict[tuple[int, int], Bucket],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n_edge = len(_SPREAD_BREAKS) + 1
+    fieldnames = [
+        "moneyline_bucket",
+        "spread_bin_index",
+        "spread_bin_label",
+        "wins",
+        "losses",
+        "ties",
+        "no_result",
+        "decided_games",
+        "win_rate_wl_only",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for ml_i in ML_BUCKET_ORDER:
+            for edge_i in range(n_edge):
+                b = spread_bins.get((ml_i, edge_i)) or Bucket()
+                label, _ = _matchup_spread_bin_bounds(edge_i)
+                w.writerow(
+                    {
+                        "moneyline_bucket": _moneyline_bin_label(ml_i),
+                        "spread_bin_index": edge_i,
+                        "spread_bin_label": label,
+                        "wins": b.wins,
+                        "losses": b.losses,
+                        "ties": b.ties,
+                        "no_result": b.no_result,
+                        "decided_games": b.decided(),
+                        "win_rate_wl_only": _rate(b),
+                    }
+                )
+
+
+def _write_ml_edge_sign_csv(
+    path: Path,
+    grid: dict[tuple[int, str], Bucket],
+    *,
+    edge_labels: dict[str, str],
+    edge_col: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "moneyline_bucket",
+        edge_col,
+        "description",
+        "wins",
+        "losses",
+        "ties",
+        "no_result",
+        "decided_games",
+        "win_rate_wl_only",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for ml_i in ML_BUCKET_ORDER:
+            for edge in EDGE_ORDER:
+                b = grid.get((ml_i, edge)) or Bucket()
+                desc = f"{_moneyline_bin_label(ml_i)}; {edge_labels.get(edge, edge)}"
+                w.writerow(
+                    {
+                        "moneyline_bucket": _moneyline_bin_label(ml_i),
+                        edge_col: edge,
+                        "description": desc,
                         "wins": b.wins,
                         "losses": b.losses,
                         "ties": b.ties,
@@ -991,6 +1150,127 @@ def _write_hit_x_pitch_heatmap(
     plt.close(fig)
 
 
+def _write_spread_ml_heatmap(
+    path: Path,
+    spread_bins: dict[tuple[int, int], Bucket],
+    meta_lines: list[str],
+    *,
+    edge_axis_label: str,
+    title: str,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n_edge = len(_SPREAD_BREAKS) + 1
+    n_ml = len(_ML_BUCKET_BOUNDS)
+    xlabels: list[str] = []
+    for i in range(n_edge):
+        lbl, _ = _matchup_spread_bin_bounds(i)
+        xlabels.append(lbl)
+
+    rates: list[list[float]] = []
+    ann: list[list[str]] = []
+    for ml_i in ML_BUCKET_ORDER:
+        rrow: list[float] = []
+        arow: list[str] = []
+        for edge_i in range(n_edge):
+            b = spread_bins.get((ml_i, edge_i)) or Bucket()
+            wr = b.win_rate()
+            rrow.append(float(wr) if wr is not None else float("nan"))
+            arow.append(
+                f"{wr:.0%}\nn={b.decided()}" if wr is not None else f"n/a\nn={b.decided()}"
+            )
+        rates.append(rrow)
+        ann.append(arow)
+
+    fig, ax = plt.subplots(figsize=(13, 4.8))
+    cmap = _rdylgn_cmap(plt)
+    im = ax.imshow(
+        rates,
+        aspect="auto",
+        cmap=cmap,
+        vmin=0.0,
+        vmax=1.0,
+        interpolation="nearest",
+    )
+    ax.set_xticks(range(n_edge))
+    ax.set_xticklabels(xlabels, rotation=38, ha="right", fontsize=8)
+    ax.set_yticks(range(n_ml))
+    ax.set_yticklabels([_moneyline_bin_label(i) for i in ML_BUCKET_ORDER], fontsize=10)
+    ax.set_xlabel(edge_axis_label)
+    ax.set_ylabel("Moneyline bucket")
+    ax.set_title(title, fontsize=11)
+    for i in range(n_ml):
+        for j in range(n_edge):
+            ax.text(j, i, ann[i][j], ha="center", va="center", fontsize=7, color="black")
+    plt.colorbar(im, ax=ax, fraction=0.025, pad=0.02, label="Win rate")
+    fig.text(0.01, 0.01, "\n".join(meta_lines), fontsize=7, color="#444444", va="bottom")
+    fig.subplots_adjust(bottom=0.34, top=0.84, left=0.14, right=0.97)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _write_ml_edge_sign_heatmap(
+    path: Path,
+    grid: dict[tuple[int, str], Bucket],
+    meta_lines: list[str],
+    *,
+    edge_labels: dict[str, str],
+    y_title: str,
+    title: str,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n_cols = len(EDGE_ORDER)
+    n_ml = len(_ML_BUCKET_BOUNDS)
+    rates: list[list[float]] = []
+    ann: list[list[str]] = []
+    for ml_i in ML_BUCKET_ORDER:
+        rrow: list[float] = []
+        arow: list[str] = []
+        for edge in EDGE_ORDER:
+            b = grid.get((ml_i, edge)) or Bucket()
+            wr = b.win_rate()
+            rrow.append(float(wr) if wr is not None else float("nan"))
+            arow.append(
+                f"{wr:.0%}\nn={b.decided()}" if wr is not None else f"n/a\nn={b.decided()}"
+            )
+        rates.append(rrow)
+        ann.append(arow)
+
+    fig, ax = plt.subplots(figsize=(9.5, 4.6))
+    cmap = _rdylgn_cmap(plt)
+    im = ax.imshow(
+        rates,
+        aspect="auto",
+        cmap=cmap,
+        vmin=0.0,
+        vmax=1.0,
+        interpolation="nearest",
+    )
+    ax.set_xticks(range(n_cols))
+    ax.set_xticklabels(
+        [edge_labels.get(e, e).split(" (")[0] for e in EDGE_ORDER],
+        rotation=18,
+        ha="right",
+        fontsize=9,
+    )
+    ax.set_yticks(range(n_ml))
+    ax.set_yticklabels([_moneyline_bin_label(i) for i in ML_BUCKET_ORDER], fontsize=10)
+    ax.set_xlabel(y_title)
+    ax.set_ylabel("Moneyline bucket")
+    ax.set_title(title, fontsize=11)
+    for i in range(n_ml):
+        for j in range(n_cols):
+            ax.text(j, i, ann[i][j], ha="center", va="center", fontsize=8, color="black")
+    plt.colorbar(im, ax=ax, fraction=0.035, pad=0.02, label="Win rate")
+    fig.text(0.01, 0.02, "\n".join(meta_lines), fontsize=7, color="#444444", va="bottom")
+    fig.subplots_adjust(bottom=0.28, top=0.82, left=0.16, right=0.96)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def run(
     data_dir: Path,
     out_csv: Path,
@@ -1009,9 +1289,18 @@ def run(
     pitch_spread_csv = base / "historic_pitching_spread_by_odds.csv"
     pitch_spread_png = base / "historic_pitching_spread_winrate.png"
     marginals_csv = base / "historic_marginals_by_bucket.csv"
-    combo_csv = base / "historic_odds_hitting_pitching_combo.csv"
-    hit_pitch_csv = base / "historic_hitting_x_pitching_sign.csv"
-    hit_pitch_png = base / "historic_hitting_x_pitching_sign.png"
+    odds_hit_sign_csv = base / "historic_odds_vs_hitting_sign.csv"
+    odds_hit_sign_png = base / "historic_odds_vs_hitting_sign.png"
+    pitch_odds_results_csv = base / "historic_matchup_pitching_odds_results.csv"
+    pitch_odds_results_png = base / "historic_matchup_pitching_odds_results.png"
+    hit_spread_ml_csv = base / "historic_hitting_spread_by_moneyline.csv"
+    hit_spread_ml_png = base / "historic_hitting_spread_by_moneyline.png"
+    pitch_spread_ml_csv = base / "historic_pitching_spread_by_moneyline.csv"
+    pitch_spread_ml_png = base / "historic_pitching_spread_by_moneyline.png"
+    hit_sign_ml_csv = base / "historic_hitting_sign_by_moneyline.csv"
+    hit_sign_ml_png = base / "historic_hitting_sign_by_moneyline.png"
+    pitch_sign_ml_csv = base / "historic_pitching_sign_by_moneyline.csv"
+    pitch_sign_ml_png = base / "historic_pitching_sign_by_moneyline.png"
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     meta = {
@@ -1022,12 +1311,15 @@ def run(
             "; ".join(c.missing_results) if c.missing_results else "(none)"
         ),
         "has_net_pitching_obp_in_any_file": str(c.has_pitching_column),
+        "has_moneyline_in_any_file": str(c.has_moneyline_column),
     }
     meta_lines = [f"{k}: {v}" for k, v in meta.items()]
 
     if "csv" in formats:
         _write_csv(out_csv, c.grid_odds_hitting)
         print(f"Wrote {out_csv}")
+        _write_csv(odds_hit_sign_csv, c.grid_odds_hitting)
+        print(f"Wrote {odds_hit_sign_csv}")
         _write_spread_csv(out_csv_spread, c.spread_bins_hitting)
         print(f"Wrote {out_csv_spread}")
         _write_marginals_csv(marginals_csv, c)
@@ -1035,28 +1327,69 @@ def run(
         if c.has_pitching_column:
             _write_odds_pitching_sign_csv(odds_pitch_sign_csv, c.grid_odds_pitching)
             print(f"Wrote {odds_pitch_sign_csv}")
+            _write_odds_pitching_sign_csv(pitch_odds_results_csv, c.grid_odds_pitching)
+            print(f"Wrote {pitch_odds_results_csv}")
             _write_pitching_spread_csv(pitch_spread_csv, c.spread_bins_pitching)
             print(f"Wrote {pitch_spread_csv}")
-            _write_combo_csv(combo_csv, c.grid_odds_hit_pitch)
-            print(f"Wrote {combo_csv}")
-            _write_hit_x_pitch_csv(hit_pitch_csv, c.grid_hit_x_pitch)
-            print(f"Wrote {hit_pitch_csv}")
+        if c.has_moneyline_column:
+            _write_spread_ml_csv(hit_spread_ml_csv, c.spread_bins_hitting_ml)
+            print(f"Wrote {hit_spread_ml_csv}")
+            _write_ml_edge_sign_csv(
+                hit_sign_ml_csv,
+                c.grid_ml_hitting_sign,
+                edge_labels=EDGE_LABEL,
+                edge_col="hitting_edge_bucket",
+            )
+            print(f"Wrote {hit_sign_ml_csv}")
+            if c.has_pitching_column:
+                _write_spread_ml_csv(
+                    pitch_spread_ml_csv, c.spread_bins_pitching_ml
+                )
+                print(f"Wrote {pitch_spread_ml_csv}")
+                _write_ml_edge_sign_csv(
+                    pitch_sign_ml_csv,
+                    c.grid_ml_pitching_sign,
+                    edge_labels=PITCH_EDGE_LABEL,
+                    edge_col="pitching_edge_bucket",
+                )
+                print(f"Wrote {pitch_sign_ml_csv}")
     if "txt" in formats:
         _write_txt(
             out_txt,
             c,
             meta_lines,
-            odds_hit_sign_csv=out_csv,
+            odds_hit_sign_csv=odds_hit_sign_csv,
             spread_hit_csv=out_csv_spread,
             spread_hit_png=out_png_spread,
             spread_pitch_csv=pitch_spread_csv,
             spread_pitch_png=pitch_spread_png,
             marginals_csv=marginals_csv,
-            combo_csv=combo_csv,
             pitch_sign_csv=odds_pitch_sign_csv,
             pitch_sign_png=odds_pitch_sign_png,
-            hit_pitch_csv=hit_pitch_csv,
-            hit_pitch_png=hit_pitch_png,
+            hit_spread_ml_csv=hit_spread_ml_csv if c.has_moneyline_column else None,
+            hit_spread_ml_png=hit_spread_ml_png if c.has_moneyline_column else None,
+            pitch_spread_ml_csv=(
+                pitch_spread_ml_csv
+                if c.has_moneyline_column and c.has_pitching_column
+                else None
+            ),
+            pitch_spread_ml_png=(
+                pitch_spread_ml_png
+                if c.has_moneyline_column and c.has_pitching_column
+                else None
+            ),
+            hit_sign_ml_csv=hit_sign_ml_csv if c.has_moneyline_column else None,
+            hit_sign_ml_png=hit_sign_ml_png if c.has_moneyline_column else None,
+            pitch_sign_ml_csv=(
+                pitch_sign_ml_csv
+                if c.has_moneyline_column and c.has_pitching_column
+                else None
+            ),
+            pitch_sign_ml_png=(
+                pitch_sign_ml_png
+                if c.has_moneyline_column and c.has_pitching_column
+                else None
+            ),
         )
         print(f"Wrote {out_txt}")
     for line in meta_lines:
@@ -1068,6 +1401,8 @@ def run(
         try:
             _write_plot(out_png, c.grid_odds_hitting, meta_lines)
             print(f"Wrote {out_png}")
+            _write_plot(odds_hit_sign_png, c.grid_odds_hitting, meta_lines)
+            print(f"Wrote {odds_hit_sign_png}")
             _write_spread_plot(out_png_spread, c.spread_bins_hitting, meta_lines)
             print(f"Wrote {out_png_spread}")
             if c.has_pitching_column:
@@ -1075,12 +1410,62 @@ def run(
                     odds_pitch_sign_png, c.grid_odds_pitching, meta_lines
                 )
                 print(f"Wrote {odds_pitch_sign_png}")
+                _write_odds_pitching_sign_heatmap(
+                    pitch_odds_results_png, c.grid_odds_pitching, meta_lines
+                )
+                print(f"Wrote {pitch_odds_results_png}")
                 _write_pitching_spread_heatmap(
                     pitch_spread_png, c.spread_bins_pitching, meta_lines
                 )
                 print(f"Wrote {pitch_spread_png}")
-                _write_hit_x_pitch_heatmap(hit_pitch_png, c.grid_hit_x_pitch, meta_lines)
-                print(f"Wrote {hit_pitch_png}")
+            if c.has_moneyline_column:
+                _write_spread_ml_heatmap(
+                    hit_spread_ml_png,
+                    c.spread_bins_hitting_ml,
+                    meta_lines,
+                    edge_axis_label="Hitting edge bucket (net_hitting_obp)",
+                    title=(
+                        "Win rate W/(W+L): hitting-edge bins × moneyline bucket\n"
+                        "(rows with numeric moneyline in bucket range)"
+                    ),
+                )
+                print(f"Wrote {hit_spread_ml_png}")
+                _write_ml_edge_sign_heatmap(
+                    hit_sign_ml_png,
+                    c.grid_ml_hitting_sign,
+                    meta_lines,
+                    edge_labels=EDGE_LABEL,
+                    y_title="Hitting edge sign",
+                    title=(
+                        "Win rate W/(W+L): hitting edge sign × moneyline bucket\n"
+                        "(rows with numeric moneyline in bucket range)"
+                    ),
+                )
+                print(f"Wrote {hit_sign_ml_png}")
+                if c.has_pitching_column:
+                    _write_spread_ml_heatmap(
+                        pitch_spread_ml_png,
+                        c.spread_bins_pitching_ml,
+                        meta_lines,
+                        edge_axis_label="Pitching edge bucket (net_pitching_obp)",
+                        title=(
+                            "Win rate W/(W+L): pitching-edge bins × moneyline bucket\n"
+                            "(rows with pitching column + moneyline in bucket range)"
+                        ),
+                    )
+                    print(f"Wrote {pitch_spread_ml_png}")
+                    _write_ml_edge_sign_heatmap(
+                        pitch_sign_ml_png,
+                        c.grid_ml_pitching_sign,
+                        meta_lines,
+                        edge_labels=PITCH_EDGE_LABEL,
+                        y_title="Pitching edge sign",
+                        title=(
+                            "Win rate W/(W+L): pitching edge sign × moneyline bucket\n"
+                            "(rows with pitching column + moneyline in bucket range)"
+                        ),
+                    )
+                    print(f"Wrote {pitch_sign_ml_png}")
         except ImportError as e:
             print(
                 "Skipping PNG (matplotlib not installed). From the project root run:\n"

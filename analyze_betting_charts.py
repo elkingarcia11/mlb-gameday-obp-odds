@@ -1,20 +1,11 @@
 """
 Betting analytics from historic matchup CSVs with moneylines and results.
 
-Only rows with a decided result (W/L), parsable ``net_hitting_obp`` (or legacy
-``matchup``), and a numeric ``moneyline`` are included. Everything else is
-skipped for these charts.
+Net **hitting** and **pitching** edges are analyzed in **separate** chart sets
+(no combined hitting×pitching outputs).
 
-Outputs under ``data/results/`` (CSV + PNG when matplotlib is available):
-
-- Net OBP edge vs win rate
-- Net OBP edge vs ROI (flat $100 bets)
-- Heatmap: net OBP edge × moneyline bucket → ROI
-- Actual vs implied win probability (by net OBP threshold)
-- Scatter: net OBP edge vs closing moneyline (one point per team-side)
-- Calibration: OBP-based expected win % vs actual win % by edge bucket
-- Team × net OBP edge heatmap (ROI)
-- Value score tiers (net OBP edge − implied probability)
+Each edge type requires W/L, parsable net OBP, and a numeric ``moneyline``.
+Rows missing any of those are skipped for that edge's charts only.
 """
 
 from __future__ import annotations
@@ -26,21 +17,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from analyze_historic_favorites import (
+    Bucket,
+    _ML_BUCKET_BOUNDS,
     _SPREAD_BREAKS,
+    _add_outcome,
     _matchup_spread_bin_bounds,
     _matchup_spread_bin_index,
+    _moneyline_bin_index,
+    _moneyline_bin_label,
+    _parse_moneyline,
     _parse_result,
     _row_get_ci,
     _spread_hit_from_row,
+    _spread_pitch_from_row,
 )
-
-# Moneyline column order for heatmaps (underdog → favorite).
-_ML_BUCKET_BOUNDS: list[tuple[int | None, int | None, str]] = [
-    (150, None, "+150+"),
-    (100, 149, "+100 to +149"),
-    (-149, -100, "-100 to -149"),
-    (None, -150, "-150+"),
-]
 
 _FLAT_STAKE = 100.0
 # Simple OBP-edge expectation for calibration (not a fitted model).
@@ -92,22 +82,19 @@ class RoiBucket:
 
 
 @dataclass
-class BettingCollected:
+class EdgeCollected:
     rows: list[BetRow] = field(default_factory=list)
     skipped_no_result: int = 0
     skipped_no_obp: int = 0
     skipped_no_moneyline: int = 0
+
+
+@dataclass
+class BettingCollected:
+    hitting: EdgeCollected = field(default_factory=EdgeCollected)
+    pitching: EdgeCollected = field(default_factory=EdgeCollected)
     files_scanned: int = 0
-
-
-def _parse_moneyline(raw: str) -> int | None:
-    s = (raw or "").strip()
-    if not s:
-        return None
-    try:
-        return int(s.replace("+", ""))
-    except ValueError:
-        return None
+    has_pitching_column: bool = False
 
 
 def implied_prob_american(ml: int) -> float:
@@ -122,20 +109,6 @@ def profit_flat_bet(ml: int, won: bool) -> float:
     if ml > 0:
         return float(ml)
     return _FLAT_STAKE * (100.0 / abs(ml))
-
-
-def _moneyline_bin_index(ml: int) -> int | None:
-    for i, (lo, hi, _label) in enumerate(_ML_BUCKET_BOUNDS):
-        if lo is not None and ml < lo:
-            continue
-        if hi is not None and ml > hi:
-            continue
-        return i
-    return None
-
-
-def _moneyline_bin_label(i: int) -> str:
-    return _ML_BUCKET_BOUNDS[i][2]
 
 
 def _obp_bin_midpoint(i: int) -> float:
@@ -165,33 +138,44 @@ def _collect_bet_rows(data_dir: Path) -> BettingCollected:
             field_lc = {h.strip().lower() for h in fields}
             if "moneyline" not in field_lc:
                 continue
+            file_has_pitch = "net_pitching_obp" in field_lc
+            if file_has_pitch:
+                out.has_pitching_column = True
             out.files_scanned += 1
             for row in reader:
                 res = _parse_result(row.get("results", ""))
                 if res not in {"W", "L"}:
-                    out.skipped_no_result += 1
-                    continue
-                net = _spread_hit_from_row(row, field_lc)
-                if net is None:
-                    out.skipped_no_obp += 1
+                    out.hitting.skipped_no_result += 1
+                    if file_has_pitch:
+                        out.pitching.skipped_no_result += 1
                     continue
                 ml = _parse_moneyline(_row_get_ci(row, "moneyline"))
                 if ml is None:
-                    out.skipped_no_moneyline += 1
+                    out.hitting.skipped_no_moneyline += 1
+                    if file_has_pitch:
+                        out.pitching.skipped_no_moneyline += 1
                     continue
                 imp = implied_prob_american(ml)
                 profit = profit_flat_bet(ml, res == "W")
-                out.rows.append(
-                    BetRow(
-                        game_pk=(row.get("game_pk") or "").strip(),
-                        team=(row.get("team") or "").strip(),
-                        net_obp=net,
-                        moneyline=ml,
-                        result=res,
-                        implied_prob=imp,
-                        profit=profit,
-                    )
-                )
+                base = {
+                    "game_pk": (row.get("game_pk") or "").strip(),
+                    "team": (row.get("team") or "").strip(),
+                    "moneyline": ml,
+                    "result": res,
+                    "implied_prob": imp,
+                    "profit": profit,
+                }
+                nh = _spread_hit_from_row(row, field_lc)
+                if nh is None:
+                    out.hitting.skipped_no_obp += 1
+                else:
+                    out.hitting.rows.append(BetRow(**base, net_obp=nh))
+                if file_has_pitch:
+                    npv = _spread_pitch_from_row(row, field_lc)
+                    if npv is None:
+                        out.pitching.skipped_no_obp += 1
+                    else:
+                        out.pitching.rows.append(BetRow(**base, net_obp=npv))
     return out
 
 
@@ -200,11 +184,16 @@ def _meta_lines(c: BettingCollected, data_dir: Path) -> list[str]:
     return [
         f"generated_utc: {now}",
         f"data_dir: {data_dir}",
-        f"usable_bet_rows: {len(c.rows)}",
+        f"hitting_usable_rows: {len(c.hitting.rows)}",
+        f"pitching_usable_rows: {len(c.pitching.rows)}",
         f"files_with_moneyline_and_results: {c.files_scanned}",
-        f"skipped_no_wl_result: {c.skipped_no_result}",
-        f"skipped_no_net_obp: {c.skipped_no_obp}",
-        f"skipped_no_moneyline: {c.skipped_no_moneyline}",
+        f"has_net_pitching_obp_in_any_file: {c.has_pitching_column}",
+        f"hitting_skipped_no_wl: {c.hitting.skipped_no_result}",
+        f"hitting_skipped_no_obp: {c.hitting.skipped_no_obp}",
+        f"hitting_skipped_no_moneyline: {c.hitting.skipped_no_moneyline}",
+        f"pitching_skipped_no_wl: {c.pitching.skipped_no_result}",
+        f"pitching_skipped_no_obp: {c.pitching.skipped_no_obp}",
+        f"pitching_skipped_no_moneyline: {c.pitching.skipped_no_moneyline}",
         f"flat_stake_usd: {_FLAT_STAKE}",
     ]
 
@@ -290,8 +279,19 @@ def _aggregate_obp_ml_grid(rows: list[BetRow]) -> dict[tuple[int, int], RoiBucke
     return grid
 
 
-def _write_obp_ml_heatmap_csv(
-    path: Path, grid: dict[tuple[int, int], RoiBucket]
+def _aggregate_obp_ml_winrate_grid(rows: list[BetRow]) -> dict[tuple[int, int], Bucket]:
+    grid: dict[tuple[int, int], Bucket] = {}
+    for row in rows:
+        obp_i = _matchup_spread_bin_index(row.net_obp)
+        ml_i = _moneyline_bin_index(row.moneyline)
+        if ml_i is None:
+            continue
+        _add_outcome(grid.setdefault((obp_i, ml_i), Bucket()), row.result)
+    return grid
+
+
+def _write_obp_ml_winrate_csv(
+    path: Path, grid: dict[tuple[int, int], Bucket], *, bucket_col: str
 ) -> None:
     n_obp = len(_SPREAD_BREAKS) + 1
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -299,7 +299,42 @@ def _write_obp_ml_heatmap_csv(
         w = csv.DictWriter(
             f,
             fieldnames=[
-                "net_obp_bucket",
+                bucket_col,
+                "moneyline_bucket",
+                "wins",
+                "losses",
+                "decided_games",
+                "win_rate",
+            ],
+        )
+        w.writeheader()
+        for obp_i in range(n_obp):
+            label_obp, _ = _matchup_spread_bin_bounds(obp_i)
+            for ml_i in range(len(_ML_BUCKET_BOUNDS)):
+                b = grid.get((obp_i, ml_i)) or Bucket()
+                wr = b.win_rate()
+                w.writerow(
+                    {
+                        bucket_col: label_obp,
+                        "moneyline_bucket": _moneyline_bin_label(ml_i),
+                        "wins": b.wins,
+                        "losses": b.losses,
+                        "decided_games": b.decided(),
+                        "win_rate": "" if wr is None else f"{wr:.4f}",
+                    }
+                )
+
+
+def _write_obp_ml_heatmap_csv(
+    path: Path, grid: dict[tuple[int, int], RoiBucket], *, bucket_col: str
+) -> None:
+    n_obp = len(_SPREAD_BREAKS) + 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                bucket_col,
                 "moneyline_bucket",
                 "wins",
                 "losses",
@@ -315,7 +350,7 @@ def _write_obp_ml_heatmap_csv(
                 roi = b.roi()
                 w.writerow(
                     {
-                        "net_obp_bucket": label_obp,
+                        bucket_col: label_obp,
                         "moneyline_bucket": _moneyline_bin_label(ml_i),
                         "wins": b.wins,
                         "losses": b.losses,
@@ -507,7 +542,11 @@ def _rdylgn_cmap(plt):
 
 
 def _plot_net_obp_winrate(
-    path: Path, buckets: dict[int, RoiBucket], meta_lines: list[str]
+    path: Path,
+    buckets: dict[int, RoiBucket],
+    meta_lines: list[str],
+    *,
+    edge_label: str,
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -530,8 +569,8 @@ def _plot_net_obp_winrate(
     ax.set_xticks(list(x))
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("Win %")
-    ax.set_xlabel("Net OBP edge bucket")
-    ax.set_title("Net OBP edge vs win rate (W / (W+L), flat team-sides)")
+    ax.set_xlabel(f"{edge_label} bucket")
+    ax.set_title(f"{edge_label} vs win rate (W / (W+L), flat team-sides)")
     for i, (r, n) in enumerate(zip(rates, counts)):
         if n and r == r:
             ax.text(i, r * 100 + 1, f"n={n}", ha="center", fontsize=7)
@@ -543,7 +582,11 @@ def _plot_net_obp_winrate(
 
 
 def _plot_net_obp_roi(
-    path: Path, buckets: dict[int, RoiBucket], meta_lines: list[str]
+    path: Path,
+    buckets: dict[int, RoiBucket],
+    meta_lines: list[str],
+    *,
+    edge_label: str,
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -567,8 +610,8 @@ def _plot_net_obp_roi(
     ax.set_xticks(list(x))
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("ROI %")
-    ax.set_xlabel("Net OBP edge bucket")
-    ax.set_title(f"Net OBP edge vs ROI (flat ${_FLAT_STAKE:.0f} bets)")
+    ax.set_xlabel(f"{edge_label} bucket")
+    ax.set_title(f"{edge_label} vs ROI (flat ${_FLAT_STAKE:.0f} bets)")
     for i, (r, n) in enumerate(zip(rois, counts)):
         if n and r == r:
             ax.text(i, r + (2 if r >= 0 else -4), f"n={n}", ha="center", fontsize=7)
@@ -580,7 +623,11 @@ def _plot_net_obp_roi(
 
 
 def _plot_obp_ml_heatmap(
-    path: Path, grid: dict[tuple[int, int], RoiBucket], meta_lines: list[str]
+    path: Path,
+    grid: dict[tuple[int, int], RoiBucket],
+    meta_lines: list[str],
+    *,
+    edge_label: str,
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -621,8 +668,8 @@ def _plot_obp_ml_heatmap(
     ax.set_yticks(range(n_obp))
     ax.set_yticklabels(ylabels, fontsize=8)
     ax.set_xlabel("Moneyline bucket (closing)")
-    ax.set_ylabel("Net OBP edge bucket")
-    ax.set_title("ROI % heatmap: net OBP edge × moneyline")
+    ax.set_ylabel(f"{edge_label} bucket")
+    ax.set_title(f"ROI % heatmap: {edge_label} × moneyline")
     for i in range(n_obp):
         for j in range(n_ml):
             ax.text(j, i, ann[i][j], ha="center", va="center", fontsize=7, color="black")
@@ -634,8 +681,67 @@ def _plot_obp_ml_heatmap(
     plt.close(fig)
 
 
+def _plot_obp_ml_winrate_heatmap(
+    path: Path,
+    grid: dict[tuple[int, int], Bucket],
+    meta_lines: list[str],
+    *,
+    edge_label: str,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    from analyze_historic_favorites import _rdylgn_cmap
+
+    n_obp = len(_SPREAD_BREAKS) + 1
+    n_ml = len(_ML_BUCKET_BOUNDS)
+    rates: list[list[float]] = []
+    ann: list[list[str]] = []
+    ylabels = []
+    for obp_i in range(n_obp - 1, -1, -1):
+        label, _ = _matchup_spread_bin_bounds(obp_i)
+        ylabels.append(label)
+        rrow: list[float] = []
+        arow: list[str] = []
+        for ml_i in range(n_ml):
+            b = grid.get((obp_i, ml_i)) or Bucket()
+            wr = b.win_rate()
+            rrow.append(float(wr) if wr is not None else float("nan"))
+            arow.append(
+                f"{wr:.0%}\nn={b.decided()}" if wr is not None else f"n/a\nn={b.decided()}"
+            )
+        rates.append(rrow)
+        ann.append(arow)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    cmap = _rdylgn_cmap(plt)
+    im = ax.imshow(
+        rates,
+        aspect="auto",
+        cmap=cmap,
+        vmin=0.0,
+        vmax=1.0,
+        interpolation="nearest",
+    )
+    ax.set_xticks(range(n_ml))
+    ax.set_xticklabels([_moneyline_bin_label(i) for i in range(n_ml)], rotation=25, ha="right")
+    ax.set_yticks(range(n_obp))
+    ax.set_yticklabels(ylabels, fontsize=8)
+    ax.set_xlabel("Moneyline bucket (closing)")
+    ax.set_ylabel(f"{edge_label} bucket")
+    ax.set_title(f"Win rate heatmap: {edge_label} × moneyline")
+    for i in range(n_obp):
+        for j in range(n_ml):
+            ax.text(j, i, ann[i][j], ha="center", va="center", fontsize=7, color="black")
+    plt.colorbar(im, ax=ax, fraction=0.03, pad=0.02, label="Win rate")
+    fig.text(0.01, 0.01, "\n".join(meta_lines), fontsize=7, color="#444444", va="bottom")
+    fig.subplots_adjust(bottom=0.22, left=0.22)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _plot_actual_vs_implied(
-    path: Path, rows: list[BetRow], meta_lines: list[str]
+    path: Path, rows: list[BetRow], meta_lines: list[str], *, edge_label: str
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -661,8 +767,8 @@ def _plot_actual_vs_implied(
     ax.set_xticks(list(x))
     ax.set_xticklabels(labels)
     ax.set_ylabel("Win %")
-    ax.set_xlabel("Net OBP edge threshold")
-    ax.set_title("Actual vs implied win probability")
+    ax.set_xlabel(f"{edge_label} threshold")
+    ax.set_title(f"Actual vs implied win probability ({edge_label})")
     ax.legend()
     fig.text(0.01, 0.01, "\n".join(meta_lines), fontsize=7, color="#444444", va="bottom")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -670,7 +776,9 @@ def _plot_actual_vs_implied(
     plt.close(fig)
 
 
-def _plot_scatter(path: Path, rows: list[BetRow], meta_lines: list[str]) -> None:
+def _plot_scatter(
+    path: Path, rows: list[BetRow], meta_lines: list[str], *, edge_label: str
+) -> None:
     import matplotlib.pyplot as plt
 
     xs = [r.net_obp for r in rows]
@@ -680,9 +788,9 @@ def _plot_scatter(path: Path, rows: list[BetRow], meta_lines: list[str]) -> None
     ax.scatter(xs, ys, c=colors, alpha=0.55, s=28, edgecolors="none")
     ax.axvline(0, color="#aaaaaa", linewidth=0.8)
     ax.axhline(0, color="#aaaaaa", linewidth=0.8)
-    ax.set_xlabel("Net OBP edge")
+    ax.set_xlabel(edge_label)
     ax.set_ylabel("Closing moneyline (American)")
-    ax.set_title("Net OBP edge vs closing odds (green=W, red=L)")
+    ax.set_title(f"{edge_label} vs closing odds (green=W, red=L)")
     fig.text(0.01, 0.01, "\n".join(meta_lines), fontsize=7, color="#444444", va="bottom")
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -690,7 +798,11 @@ def _plot_scatter(path: Path, rows: list[BetRow], meta_lines: list[str]) -> None
 
 
 def _plot_calibration(
-    path: Path, buckets: dict[int, RoiBucket], meta_lines: list[str]
+    path: Path,
+    buckets: dict[int, RoiBucket],
+    meta_lines: list[str],
+    *,
+    edge_label: str,
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -719,8 +831,8 @@ def _plot_calibration(
     ax.set_xticks(list(x))
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("Win %")
-    ax.set_xlabel("Net OBP edge bucket")
-    ax.set_title("Calibration: OBP-based expected vs actual win rate")
+    ax.set_xlabel(f"{edge_label} bucket")
+    ax.set_title(f"Calibration: {edge_label} expected vs actual win rate")
     ax.legend()
     fig.text(0.01, 0.01, "\n".join(meta_lines), fontsize=7, color="#444444", va="bottom")
     fig.subplots_adjust(bottom=0.32)
@@ -730,7 +842,11 @@ def _plot_calibration(
 
 
 def _plot_team_heatmap(
-    path: Path, grid: dict[tuple[str, int], RoiBucket], meta_lines: list[str]
+    path: Path,
+    grid: dict[tuple[str, int], RoiBucket],
+    meta_lines: list[str],
+    *,
+    edge_label: str,
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -769,7 +885,7 @@ def _plot_team_heatmap(
     ax.set_xticklabels(xlabels, rotation=50, ha="right", fontsize=7)
     ax.set_yticks(range(len(teams)))
     ax.set_yticklabels(teams, fontsize=8)
-    ax.set_title("Team ROI % by net OBP edge bucket")
+    ax.set_title(f"Team ROI % by {edge_label} bucket")
     for i in range(len(teams)):
         for j in range(n_bins):
             if ann[i][j]:
@@ -783,7 +899,7 @@ def _plot_team_heatmap(
 
 
 def _plot_value_score(
-    path: Path, rows: list[BetRow], meta_lines: list[str]
+    path: Path, rows: list[BetRow], meta_lines: list[str], *, edge_label: str
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -812,7 +928,7 @@ def _plot_value_score(
     ax.bar(labels, rois, color=colors)
     ax.axhline(0, color="#333333", linewidth=1)
     ax.set_ylabel("ROI %")
-    ax.set_title("Value score tiers (net OBP edge − implied probability)")
+    ax.set_title(f"Value score tiers ({edge_label} − implied probability)")
     fig.text(0.01, 0.01, "\n".join(meta_lines), fontsize=7, color="#444444", va="bottom")
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -821,17 +937,105 @@ def _plot_value_score(
 
 def _write_summary_txt(path: Path, meta_lines: list[str], outputs: list[str]) -> None:
     lines = [
-        "Betting analytics (moneyline + net OBP + results required per row)",
+        "Betting analytics — net hitting and net pitching edges analyzed separately",
         "=" * 72,
         *meta_lines,
         "",
         "Outputs:",
         *[f"  {p}" for p in outputs],
         "",
-        "Rows without W/L, net OBP, or moneyline are excluded from all charts.",
+        "Rows without W/L, parsable net edge, or moneyline are skipped per edge type.",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _run_edge_suite(
+    results_dir: Path,
+    *,
+    stem: str,
+    bucket_col: str,
+    edge_label: str,
+    rows: list[BetRow],
+    plot: bool,
+    meta_lines: list[str],
+) -> list[str]:
+    """Write CSV/PNG set for one edge type; return CSV paths written."""
+    paths = {
+        "winrate_csv": results_dir / f"historic_{stem}_vs_winrate.csv",
+        "winrate_png": results_dir / f"historic_{stem}_vs_winrate.png",
+        "roi_csv": results_dir / f"historic_{stem}_vs_roi.csv",
+        "roi_png": results_dir / f"historic_{stem}_vs_roi.png",
+        "ml_roi_csv": results_dir / f"historic_{stem}_x_moneyline_roi.csv",
+        "ml_roi_png": results_dir / f"historic_{stem}_x_moneyline_roi.png",
+        "ml_wr_csv": results_dir / f"historic_{stem}_x_moneyline_winrate.csv",
+        "ml_wr_png": results_dir / f"historic_{stem}_x_moneyline_winrate.png",
+        "implied_csv": results_dir / f"historic_{stem}_actual_vs_implied.csv",
+        "implied_png": results_dir / f"historic_{stem}_actual_vs_implied.png",
+        "scatter_png": results_dir / f"historic_{stem}_vs_moneyline_scatter.png",
+        "calibration_csv": results_dir / f"historic_{stem}_calibration_curve.csv",
+        "calibration_png": results_dir / f"historic_{stem}_calibration_curve.png",
+        "team_csv": results_dir / f"historic_team_{stem}_roi.csv",
+        "team_png": results_dir / f"historic_team_{stem}_roi.png",
+        "value_csv": results_dir / f"historic_{stem}_value_score_roi.csv",
+        "value_png": results_dir / f"historic_{stem}_value_score_roi.png",
+    }
+    if not rows:
+        print(f"No usable rows for {edge_label}; skipping {stem} charts.")
+        return []
+
+    obp_buckets = _aggregate_obp_buckets(rows)
+    obp_ml_roi = _aggregate_obp_ml_grid(rows)
+    obp_ml_wr = _aggregate_obp_ml_winrate_grid(rows)
+    team_grid = _aggregate_team_obp(rows)
+
+    _write_net_obp_winrate_csv(paths["winrate_csv"], obp_buckets)
+    _write_net_obp_roi_csv(paths["roi_csv"], obp_buckets)
+    _write_obp_ml_heatmap_csv(paths["ml_roi_csv"], obp_ml_roi, bucket_col=bucket_col)
+    _write_obp_ml_winrate_csv(paths["ml_wr_csv"], obp_ml_wr, bucket_col=bucket_col)
+    _write_actual_vs_implied_csv(paths["implied_csv"], rows)
+    _write_calibration_csv(paths["calibration_csv"], obp_buckets)
+    _write_team_obp_csv(paths["team_csv"], team_grid)
+    _write_value_score_csv(paths["value_csv"], rows)
+
+    csv_paths = [str(paths[k]) for k in paths if k.endswith("_csv")]
+    for p in csv_paths:
+        print(f"Wrote {p}")
+
+    if plot:
+        try:
+            _plot_net_obp_winrate(
+                paths["winrate_png"], obp_buckets, meta_lines, edge_label=edge_label
+            )
+            _plot_net_obp_roi(
+                paths["roi_png"], obp_buckets, meta_lines, edge_label=edge_label
+            )
+            _plot_obp_ml_heatmap(
+                paths["ml_roi_png"], obp_ml_roi, meta_lines, edge_label=edge_label
+            )
+            _plot_obp_ml_winrate_heatmap(
+                paths["ml_wr_png"], obp_ml_wr, meta_lines, edge_label=edge_label
+            )
+            _plot_actual_vs_implied(
+                paths["implied_png"], rows, meta_lines, edge_label=edge_label
+            )
+            _plot_scatter(paths["scatter_png"], rows, meta_lines, edge_label=edge_label)
+            _plot_calibration(
+                paths["calibration_png"], obp_buckets, meta_lines, edge_label=edge_label
+            )
+            _plot_team_heatmap(
+                paths["team_png"], team_grid, meta_lines, edge_label=edge_label
+            )
+            _plot_value_score(
+                paths["value_png"], rows, meta_lines, edge_label=edge_label
+            )
+            for k, p in paths.items():
+                if k.endswith("_png"):
+                    print(f"Wrote {p}")
+        except ImportError as e:
+            print(f"Skipping {stem} PNGs (matplotlib not installed). ({e})")
+
+    return csv_paths
 
 
 def run(data_dir: Path, results_dir: Path, *, plot: bool = True) -> BettingCollected:
@@ -839,89 +1043,36 @@ def run(data_dir: Path, results_dir: Path, *, plot: bool = True) -> BettingColle
     meta = _meta_lines(c, data_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    obp_buckets = _aggregate_obp_buckets(c.rows)
-    obp_ml_grid = _aggregate_obp_ml_grid(c.rows)
-    team_grid = _aggregate_team_obp(c.rows)
+    out_list: list[str] = []
+    out_list.extend(
+        _run_edge_suite(
+            results_dir,
+            stem="net_hitting_obp",
+            bucket_col="net_hitting_obp_bucket",
+            edge_label="Net hitting OBP edge",
+            rows=c.hitting.rows,
+            plot=plot,
+            meta_lines=meta,
+        )
+    )
+    if c.has_pitching_column:
+        out_list.extend(
+            _run_edge_suite(
+                results_dir,
+                stem="net_pitching_obp",
+                bucket_col="net_pitching_obp_bucket",
+                edge_label="Net pitching OBP edge",
+                rows=c.pitching.rows,
+                plot=plot,
+                meta_lines=meta,
+            )
+        )
 
-    paths = {
-        "winrate_csv": results_dir / "historic_net_obp_vs_winrate.csv",
-        "winrate_png": results_dir / "historic_net_obp_vs_winrate.png",
-        "roi_csv": results_dir / "historic_net_obp_vs_roi.csv",
-        "roi_png": results_dir / "historic_net_obp_vs_roi.png",
-        "heatmap_csv": results_dir / "historic_net_obp_x_moneyline_roi.csv",
-        "heatmap_png": results_dir / "historic_net_obp_x_moneyline_roi.png",
-        "implied_csv": results_dir / "historic_actual_vs_implied.csv",
-        "implied_png": results_dir / "historic_actual_vs_implied.png",
-        "scatter_png": results_dir / "historic_net_obp_vs_moneyline_scatter.png",
-        "calibration_csv": results_dir / "historic_calibration_curve.csv",
-        "calibration_png": results_dir / "historic_calibration_curve.png",
-        "team_csv": results_dir / "historic_team_net_obp_roi.csv",
-        "team_png": results_dir / "historic_team_net_obp_roi.png",
-        "value_csv": results_dir / "historic_value_score_roi.csv",
-        "value_png": results_dir / "historic_value_score_roi.png",
-        "summary_txt": results_dir / "historic_betting_charts.txt",
-    }
-
-    _write_net_obp_winrate_csv(paths["winrate_csv"], obp_buckets)
-    _write_net_obp_roi_csv(paths["roi_csv"], obp_buckets)
-    _write_obp_ml_heatmap_csv(paths["heatmap_csv"], obp_ml_grid)
-    _write_actual_vs_implied_csv(paths["implied_csv"], c.rows)
-    _write_calibration_csv(paths["calibration_csv"], obp_buckets)
-    _write_team_obp_csv(paths["team_csv"], team_grid)
-    _write_value_score_csv(paths["value_csv"], c.rows)
-
-    for key in (
-        "winrate_csv",
-        "roi_csv",
-        "heatmap_csv",
-        "implied_csv",
-        "calibration_csv",
-        "team_csv",
-        "value_csv",
-    ):
-        print(f"Wrote {paths[key]}")
-
-    out_list = [str(paths[k]) for k in paths if k.endswith("_csv") or k == "summary_txt"]
-    _write_summary_txt(paths["summary_txt"], meta, out_list)
-    print(f"Wrote {paths['summary_txt']}")
-
+    summary = results_dir / "historic_betting_charts.txt"
+    _write_summary_txt(summary, meta, out_list)
+    print(f"Wrote {summary}")
     for line in meta:
         print(line)
-
-    if not c.rows:
-        print(
-            "No usable bet rows (need results + moneyline + net_hitting_obp). "
-            "Skipping PNG charts."
-        )
-        return c
-
-    if plot:
-        try:
-            _plot_net_obp_winrate(paths["winrate_png"], obp_buckets, meta)
-            _plot_net_obp_roi(paths["roi_png"], obp_buckets, meta)
-            _plot_obp_ml_heatmap(paths["heatmap_png"], obp_ml_grid, meta)
-            _plot_actual_vs_implied(paths["implied_png"], c.rows, meta)
-            _plot_scatter(paths["scatter_png"], c.rows, meta)
-            _plot_calibration(paths["calibration_png"], obp_buckets, meta)
-            _plot_team_heatmap(paths["team_png"], team_grid, meta)
-            _plot_value_score(paths["value_png"], c.rows, meta)
-            for key in (
-                "winrate_png",
-                "roi_png",
-                "heatmap_png",
-                "implied_png",
-                "scatter_png",
-                "calibration_png",
-                "team_png",
-                "value_png",
-            ):
-                print(f"Wrote {paths[key]}")
-        except ImportError as e:
-            print(
-                "Skipping betting PNGs (matplotlib not installed). "
-                f"({e})"
-            )
-
     return c
 
 
